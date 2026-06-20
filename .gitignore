@@ -1,0 +1,56 @@
+# ======================================
+# Keil MDK-ARM (STM32) 项目忽略规则
+# ======================================
+
+# 编译输出目录
+**/Objects/
+**/Listings/
+
+# Keil 用户个性化配置（项目文件 .uvprojx 保留）
+*.uvguix.*
+*.uvoptx
+
+# 调试配置目录
+**/DebugConfig/
+
+# 编译中间与结果文件
+*.o
+*.d
+*.crf
+*.axf
+*.elf
+*.map
+*.lst
+*.dep
+*.lnp
+*.sct
+*.htm
+*.build_log.htm
+*.hex
+*.bin
+
+# ======================================
+# 通用系统与编辑器忽略
+# ======================================
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 备份文件
+*.bak
+*.old
+*.tmp
+*~
+
+# VS Code / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
