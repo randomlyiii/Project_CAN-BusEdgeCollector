@@ -450,6 +450,26 @@
               <FileType>5</FileType>
               <FilePath>.\Hardware\OLED_Font.h</FilePath>
             </File>
+            <File>
+              <FileName>CAN_User.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\CAN_User.c</FilePath>
+            </File>
+            <File>
+              <FileName>CAN_User.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\CAN_User.h</FilePath>
+            </File>
+            <File>
+              <FileName>KEY.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\KEY.c</FilePath>
+            </File>
+            <File>
+              <FileName>KEY.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\KEY.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

@@ -52,5 +52,9 @@ Desktop.ini
 # VS Code / IDE
 .vscode/
 .idea/
+.claude
 *.swp
 *.swo
+
+# 设计文档排除上传
+阶段一.md

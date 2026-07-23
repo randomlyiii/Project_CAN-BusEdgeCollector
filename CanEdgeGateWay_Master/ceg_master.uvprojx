@@ -445,6 +445,36 @@
               <FileType>5</FileType>
               <FilePath>.\Hardware\OLED_Font.h</FilePath>
             </File>
+            <File>
+              <FileName>CAN_User.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\CAN_User.c</FilePath>
+            </File>
+            <File>
+              <FileName>CAN_User.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\CAN_User.h</FilePath>
+            </File>
+            <File>
+              <FileName>W5500.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\W5500.c</FilePath>
+            </File>
+            <File>
+              <FileName>W5500.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\W5500.h</FilePath>
+            </File>
+            <File>
+              <FileName>ModbusTCP.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\ModbusTCP.c</FilePath>
+            </File>
+            <File>
+              <FileName>ModbusTCP.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\ModbusTCP.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
