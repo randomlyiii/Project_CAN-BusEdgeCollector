@@ -8,6 +8,31 @@
 
 #include "stm32f10x.h"
 #include "delay.h"
+#include "../FreeRTOS/inc/FreeRTOS.h"
+
+/* ---- DWT register definitions (CMSIS v1.30 compat) ---- */
+
+#ifndef DWT_BASE
+#define DWT_BASE            (0xE0001000UL)
+#endif
+
+typedef struct {
+    volatile uint32_t CTRL;
+    volatile uint32_t CYCCNT;
+    volatile uint32_t CPICNT;
+    volatile uint32_t EXCCNT;
+    volatile uint32_t SLEEPCNT;
+    volatile uint32_t LSUCNT;
+    volatile uint32_t FOLDCNT;
+    volatile uint32_t PCSR;
+} DWT_Type;
+
+#define DWT                 ((DWT_Type *)DWT_BASE)
+#define DWT_CTRL_CYCCNTENA_Msk   (1UL << 0)
+
+#ifndef CoreDebug_DEMCR_TRCENA_Msk
+#define CoreDebug_DEMCR_TRCENA_Msk  (1UL << 24)
+#endif
 
 /* ---- DWT microsecond delay (does not touch SysTick) ---- */
 
@@ -67,7 +92,14 @@ void SysTick_Handler(void)
 {
     /* FreeRTOS tick increment + possible context switch */
     extern void xPortSysTickHandler(void);
+#if (INCLUDE_xTaskGetSchedulerState == 1)
+    if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
+    {
+        xPortSysTickHandler();
+    }
+#else
     xPortSysTickHandler();
+#endif
 }
 
 /**

@@ -9,6 +9,7 @@
  */
 
 #include "stm32f10x_it.h"
+#include "oled.h"
 
 void NMI_Handler(void)
 {
@@ -16,21 +17,30 @@ void NMI_Handler(void)
 
 void HardFault_Handler(void)
 {
+    OLED_Clear();
+    OLED_ShowString(1, 1, "HARD FAULT!");
+    OLED_ShowString(2, 1, "Check stack");
     while (1) { }
 }
 
 void MemManage_Handler(void)
 {
+    OLED_Clear();
+    OLED_ShowString(1, 1, "MEM MANAGE FLT");
     while (1) { }
 }
 
 void BusFault_Handler(void)
 {
+    OLED_Clear();
+    OLED_ShowString(1, 1, "BUS FAULT!");
     while (1) { }
 }
 
 void UsageFault_Handler(void)
 {
+    OLED_Clear();
+    OLED_ShowString(1, 1, "USAGE FAULT!");
     while (1) { }
 }
 

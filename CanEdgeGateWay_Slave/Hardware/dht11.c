@@ -23,16 +23,24 @@ static void DHT11_Start(void)
     DHT11_DATA_MODE_IN();
 }
 
+#define DHT11_TIMEOUT  10000   /* ~100us timeout per poll iteration */
+
 static uint8_t DHT11_Read_Byte(void)
 {
     uint8_t i, dat = 0;
     for (i = 0; i < 8; i++)
     {
-        while (DHT11_DATA_READ() == 0);
+        uint16_t to = DHT11_TIMEOUT;
+        while (DHT11_DATA_READ() == 0 && --to);
+        if (to == 0) return 0;   /* timeout */
+
         Delay_us(40);
         dat <<= 1;
         if (DHT11_DATA_READ()) dat++;
-        while (DHT11_DATA_READ() == 1);
+
+        to = DHT11_TIMEOUT;
+        while (DHT11_DATA_READ() == 1 && --to);
+        if (to == 0) return 0;   /* timeout */
     }
     return dat;
 }
@@ -41,13 +49,19 @@ uint8_t DHT11_Read_Data(uint8_t *humi_int, uint8_t *humi_dec,
                         uint8_t *temp_int, uint8_t *temp_dec)
 {
     uint8_t buf[5];
+    uint16_t to;
 
     DHT11_Start();
 
     if (DHT11_DATA_READ() == 0)
     {
-        while (DHT11_DATA_READ() == 0);
-        while (DHT11_DATA_READ() == 1);
+        to = DHT11_TIMEOUT;
+        while (DHT11_DATA_READ() == 0 && --to);
+        if (to == 0) return 1;
+
+        to = DHT11_TIMEOUT;
+        while (DHT11_DATA_READ() == 1 && --to);
+        if (to == 0) return 1;
 
         buf[0] = DHT11_Read_Byte();
         buf[1] = DHT11_Read_Byte();

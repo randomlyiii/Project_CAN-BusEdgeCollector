@@ -2,7 +2,16 @@
  * FreeRTOS V10.4.6 Configuration for CAN Edge Gateway Slave
  * STM32F103C8T6 @ 72MHz, Keil MDK-ARM
  *
- * Same as Master config — same MCU, same clock, same FreeRTOS setup.
+ * ==================== FreeRTOS 内核路径 ====================
+ * 当前: 共用项目根目录下的 FreeRTOS/ 内核
+ *
+ * 如需本工程独立使用不同版本/裁剪的内核:
+ *   1. 将 FreeRTOS/ 复制到本工程目录下 (如 CanEdgeGateWay_Slave/FreeRTOS/)
+ *   2. 将文件末尾 #include 路径改为 "../FreeRTOS/inc/FreeRTOS.h"
+ *   3. Keil 工程 → Options → C/C++ → Include Paths 同步修改
+ *
+ * 文件组织:
+ *   独立模式:             #include "../FreeRTOS/inc/FreeRTOS.h"
  */
 
 #ifndef FREERTOS_CONFIG_H
@@ -15,7 +24,7 @@
 #define configTICK_RATE_HZ                      ((TickType_t)1000)
 #define configMAX_PRIORITIES                    (8)
 #define configMINIMAL_STACK_SIZE                ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                   ((size_t)(15 * 1024))
+#define configTOTAL_HEAP_SIZE                   ((size_t)(10 * 1024))
 #define configMAX_TASK_NAME_LEN                 (16)
 #define configUSE_16_BIT_TICKS                  0
 #define configUSE_MUTEXES                       1
@@ -50,10 +59,12 @@
 
 #define configASSERT(x)                  if ((x) == 0) { taskDISABLE_INTERRUPTS(); for(;;); }
 
-/* ISR name mapping */
+/* ISR handler name mapping (macros rename FreeRTOS default names → vector table names) */
 #define vPortSVCHandler        SVC_Handler
 #define xPortPendSVHandler     PendSV_Handler
-#define xPortSysTickHandler    SysTick_Handler
+/* SysTick: handled by System/Delay.c → calls xPortSysTickHandler() */
+
+#define configASSERT_DEFINED   0   /* skip portASSERT_IF_INTERRUPT_PRIORITY_INVALID checks */
 
 /* Optional features */
 #define INCLUDE_vTaskPrioritySet              1
@@ -70,5 +81,8 @@
 #define INCLUDE_xTaskGetIdleTaskHandle        1
 #define INCLUDE_pcTaskGetTaskName             1
 #define INCLUDE_xTaskAbortDelay               0
+
+/* ---- 引入 FreeRTOS 内核 (必须在所有 config 宏定义之后) ---- */
+#include "../FreeRTOS/inc/FreeRTOS.h"
 
 #endif /* FREERTOS_CONFIG_H */
