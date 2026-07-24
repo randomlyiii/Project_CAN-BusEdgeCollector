@@ -1,6 +1,13 @@
 #include "stm32f10x.h"
 #include "OLED_Font.h"
 
+/* 软件I2C延时 (~2us @72MHz), 保证SCL频率不超过400kHz */
+static void I2C_Delay(void)
+{
+    volatile uint32_t i;
+    for (i = 0; i < 40; i++) __NOP();
+}
+
 /*引脚配置*/
 #define OLED_W_SCL(x)		GPIO_WriteBit(GPIOB, GPIO_Pin_8, (BitAction)(x))
 #define OLED_W_SDA(x)		GPIO_WriteBit(GPIOB, GPIO_Pin_9, (BitAction)(x))
@@ -30,9 +37,13 @@ void OLED_I2C_Init(void)
 void OLED_I2C_Start(void)
 {
 	OLED_W_SDA(1);
+	I2C_Delay();
 	OLED_W_SCL(1);
+	I2C_Delay();
 	OLED_W_SDA(0);
+	I2C_Delay();
 	OLED_W_SCL(0);
+	I2C_Delay();
 }
 
 /**
@@ -43,8 +54,11 @@ void OLED_I2C_Start(void)
 void OLED_I2C_Stop(void)
 {
 	OLED_W_SDA(0);
+	I2C_Delay();
 	OLED_W_SCL(1);
+	I2C_Delay();
 	OLED_W_SDA(1);
+	I2C_Delay();
 }
 
 /**
@@ -58,11 +72,16 @@ void OLED_I2C_SendByte(uint8_t Byte)
 	for (i = 0; i < 8; i++)
 	{
 		OLED_W_SDA(!!(Byte & (0x80 >> i)));
+		I2C_Delay();
 		OLED_W_SCL(1);
+		I2C_Delay();
 		OLED_W_SCL(0);
+		I2C_Delay();
 	}
 	OLED_W_SCL(1);	//额外的一个时钟，不处理应答信号
+	I2C_Delay();
 	OLED_W_SCL(0);
+	I2C_Delay();
 }
 
 /**
