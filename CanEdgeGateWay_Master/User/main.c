@@ -7,104 +7,119 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ======================== OLED 显示缓冲区 ======================== */
-static char g_oled_line[4][17];     // 4行×16字符
+#pragma import(__use_no_semihosting_swi)
+struct __FILE { int handle; };
+FILE __stdout = {0};
+void _sys_exit(int x) { x = x; }
 
-/* ======================== 周期任务定时器 ======================== */
-static uint32_t g_last_oled_tick      = 0;
-static uint32_t g_last_hbcheck_tick   = 0;
-static uint32_t g_last_sync_tick      = 0;
+static char     g_oled_line[4][17];
+static uint32_t g_last_oled_tick    = 0;
+static uint32_t g_last_hbcheck_tick = 0;
+static uint32_t g_last_sync_tick    = 0;
 
-/* OLED 刷新间隔 */
-#define OLED_UPDATE_MS              300    // 300ms 刷新一次
-#define HB_CHECK_MS                 200    // 200ms 检测一次心跳
-#define SYNC_MODBUS_MS              100    // 100ms 同步一次寄存器
+#define OLED_UPDATE_MS   300
+#define HB_CHECK_MS      200
+#define SYNC_MODBUS_MS   100
 
-/* ======================== CAN 回调实现 ======================== */
+void CAN_User_OnError(uint8_t level)      { (void)level; }
+void CAN_User_OnAlarm(uint8_t node_id, uint8_t func) { (void)node_id; (void)func; }
+void CAN_User_OnNodeUpdate(uint8_t node_id) { (void)node_id; }
 
-/* 错误事件回调 */
-void CAN_User_OnError(uint8_t level)
+/*
+ * 获取以太网状态字符串
+ *   "FAIL"=芯片异常  "NOLK"=无网线  "CON"=已连接
+ *   "LSN"=监听中    "CLS"=已关闭    "SR:XX"=其他状态
+ */
+static const char *ETH_StateStr(void)
 {
-    (void)level;
-}
+    if (!W5500_IsOnline())                   return "FAIL";
+    if (!W5500_LinkUp())                     return "NOLK";
+    if (W5500_IsConnected())                 return "CON ";
 
-/* 报警事件回调 */
-void CAN_User_OnAlarm(uint8_t node_id, uint8_t func)
-{
-    (void)node_id;
-    (void)func;
-}
+    uint8_t sr = W5500_ReadByte(BSB_SOCK0_REG, OFF_SN_SR);
+    if (sr == SOCK_LISTEN)                   return "LSN ";
+    if (sr == SOCK_CLOSED)                   return "CLS ";
 
-/* 从站数据更新回调 */
-void CAN_User_OnNodeUpdate(uint8_t node_id)
-{
-    (void)node_id;
+    static char buf[6];
+    sprintf(buf, "SR:%02X", sr);
+    return buf;
 }
-
-/* ======================== OLED 显示更新 ======================== */
 
 static void OLED_UpdateDisplay(void)
 {
-    uint8_t  i;
-    int16_t  temp_c1, humi_pct1;
-    uint8_t  online1, fault1;
+    uint8_t online1 = g_slave_nodes[0].online;
+    uint8_t fault1  = g_slave_nodes[0].fault_flag;
+    const char *can = (g_can_error.error_level == 0) ? "OK" : "ERR";
 
-    /* ---- 第1行: 主站状态 ---- */
-    /* "M:CAN OK Eth:Con"  或 "M:CAN ERR Eth:Dis" */
-    sprintf(g_oled_line[0], "M:%s E:%s",
-            (g_can_error.error_level == 0) ? "CAN OK" : "CAN ERR",
-            W5500_IsConnected() ? "CON" : "DIS");
+    /* 第1行: CAN状态 + 以太网状态 */
+    sprintf(g_oled_line[0], "CAN:%-3s ETH:%-4s", can, ETH_StateStr());
 
-    /* ---- 第2行: 从站1 温度 ---- */
-    /* "S1:25.3C Onln   " 或 "S1:OFFLINE     " */
-    online1 = g_slave_nodes[0].online;
-    fault1  = g_slave_nodes[0].fault_flag;
+    /* 第2行: 从站1 温度 + 总线负载 */
     if (online1) {
-        temp_c1 = (int16_t)g_slave_nodes[0].temp_int * 10 + g_slave_nodes[0].temp_dec;
-        sprintf(g_oled_line[1], "S1:%d.%dC%s%s",
-                g_slave_nodes[0].temp_int, g_slave_nodes[0].temp_dec,
-                fault1 ? " ALM" : "    ",
-                g_slave_nodes[0].blacklist ? "BLK" : "   ");
-    } else {
-        sprintf(g_oled_line[1], "S1:OFFLN    ");
+        uint16_t load = g_can_error.bus_load;  /* 0~10000 = 0.00%~100.00% */
+        if (load < 1000) {
+            /* <10%: 显示两位小数, 如 L:0.06% */
+            sprintf(g_oled_line[1], "S1:%d.%dC L:%u.%02u%%",
+                    g_slave_nodes[0].temp_int, g_slave_nodes[0].temp_dec,
+                    load / 100, load % 100);
+        } else {
+            /* >=10%: 四舍五入到一位小数, 节省1字符, 如 L:90.7% */
+            uint16_t r = (load + 5) / 10;  /* 0~1000, 单位0.1% */
+            if (r >= 1000) {
+                sprintf(g_oled_line[1], "S1:%d.%dC L:100%%",
+                        g_slave_nodes[0].temp_int, g_slave_nodes[0].temp_dec);
+            } else {
+                sprintf(g_oled_line[1], "S1:%d.%dC L:%u.%u%%",
+                        g_slave_nodes[0].temp_int, g_slave_nodes[0].temp_dec,
+                        r / 10, r % 10);
+            }
+        }
+    } else
+        sprintf(g_oled_line[1], "S1:--.-C L:--%% ");
+
+    /* 第3行: 湿度 + 心跳 */
+    sprintf(g_oled_line[2], "H:%d.%d%% HB:%-5u",
+            g_slave_nodes[0].humi_int, g_slave_nodes[0].humi_dec,
+            g_slave_nodes[0].heartbeat_count);
+
+    /* 第4行: R=CAN帧 T=温湿度帧 + 状态 */
+    {
+        char r_str[5], t_str[4];
+        const char *status;
+        uint32_t rx = g_can_rx_int_count;
+        uint32_t th = g_can_rx_temp_count;
+
+        if      (rx >= 1000000) sprintf(r_str, "%luM", rx/1000000);
+        else if (rx >= 10000)   sprintf(r_str, "%luK", rx/1000);
+        else if (rx >= 1000)    sprintf(r_str, "%lu.%luK", rx/1000, (rx%1000)/100);
+        else                    sprintf(r_str, "%lu", rx);
+
+        if      (th >= 1000000) sprintf(t_str, "%luM", th/1000000);
+        else if (th >= 10000)   sprintf(t_str, "%luK", th/1000);
+        else if (th >= 1000)    sprintf(t_str, "%lu.%luK", th/1000, (th%1000)/100);
+        else                    sprintf(t_str, "%lu", th);
+
+        if (!online1)               status = "OFF";
+        else if (fault1)            status = "ALM";
+        else if (g_slave_nodes[0].blacklist) status = "BLK";
+        else                        status = "OK ";
+
+        sprintf(g_oled_line[3], "R%-4s T%-3s %-3s", r_str, t_str, status);
     }
 
-    /* ---- 第3行: 从站1 湿度 + CAN 负载率 ---- */
-    /* "H:62.1% Ld:12% " */
-    if (g_slave_nodes[0].online) {
-        humi_pct1 = (int16_t)g_slave_nodes[0].humi_int * 10 + g_slave_nodes[0].humi_dec;
-        sprintf(g_oled_line[2], "H:%d.%d%% Ld:%d%% ",
-                g_slave_nodes[0].humi_int, g_slave_nodes[0].humi_dec,
-                g_can_error.bus_load / 10);  // 负载率 0~1000 → 0.0%~100.0%
-    } else {
-        sprintf(g_oled_line[2], "Ld:%d%% HB:%d  ",
-                g_can_error.bus_load / 10,
-                g_slave_nodes[0].heartbeat_count);
-    }
-
-    /* ---- 第4行: CAN 错误状态 + 以太网IP ---- */
-    /* "TEC:%3d REC:%3d " */
-    if (g_can_error.error_level > 0) {
-        sprintf(g_oled_line[3], "T:%d R:%d Lv%d",
-                g_can_error.tec, g_can_error.rec, g_can_error.error_level);
-    } else {
-        sprintf(g_oled_line[3], "192.168.1.100  ");
-    }
-
-    /* ---- 刷新 OLED ---- */
+    uint8_t i;
     for (i = 0; i < 4; i++) {
-        g_oled_line[i][16] = '\0';            // 截断到16字符
+        g_oled_line[i][16] = '\0';
         OLED_ShowString(i + 1, 1, g_oled_line[i]);
     }
 }
 
-/* ======================== 主函数 ======================== */
-
 int main(void)
 {
-    /* ---- 系统初始化 ---- */
-    Delay_InitTick();             // SysTick 1ms 滴答 (必须在最前)
-    Delay_ms(200);                // 上电稳定延时
+    int8_t ret;
+
+    Delay_InitTick();
+    Delay_ms(200);
 
     OLED_Init();
     OLED_Clear();
@@ -113,33 +128,37 @@ int main(void)
     CAN_User_Init();
     OLED_ShowString(2, 1, "   CAN OK");
 
-    W5500_Init();
-    W5500_ConfigNetwork();
-    W5500_TCPServer_Start(MODBUS_PORT);
-    OLED_ShowString(3, 1, "   ETH OK");
+    /* --- W5500 初始化 --- */
+    ret = W5500_Init();
+    if (ret != W5500_OK) {
+        OLED_ShowString(3, 1, "   W5500 FAIL!");
+        char diag[17];
+        sprintf(diag, "   Ver:0x%02X", g_w5500_version);
+        OLED_ShowString(4, 1, diag);
+        while (1);  /* 芯片异常 → 停在这里 */
+    }
 
+    ret = W5500_ConfigNetwork();
+    if (ret != W5500_OK) {
+        OLED_ShowString(3, 1, "   NET CFG ERR");
+    } else {
+        OLED_ShowString(3, 1, "   ETH OK");
+        OLED_ShowString(4, 1, "Server OK");
+        W5500_TCPServer_Start(MODBUS_PORT);
+    }
+
+    Delay_ms(1500);
     ModbusTCP_Init();
-    OLED_ShowString(4, 1, "   Ready!");
-
-    Delay_ms(1000);
     OLED_Clear();
 
-    /* 初始化定时器 */
     g_last_oled_tick    = Delay_GetTick();
     g_last_hbcheck_tick = Delay_GetTick();
     g_last_sync_tick    = Delay_GetTick();
 
-    /* ---- 主循环 ---- */
     while (1)
     {
         uint32_t now = Delay_GetTick();
 
-        /* --- 1. CAN 接收处理 (每次循环都检查) --- */
-        if (g_can_rx_flag) {
-            CAN_ProcessRxFrame();
-        }
-
-        /* --- 2. 心跳超时检测 (200ms) --- */
         if (now - g_last_hbcheck_tick >= HB_CHECK_MS) {
             CAN_HeartBeatCheck();
             CAN_ErrorMonitor();
@@ -147,25 +166,18 @@ int main(void)
             g_last_hbcheck_tick = now;
         }
 
-        /* --- 3. W5500 TCP Server 轮询 --- */
         W5500_TCPServer_Run();
 
-        /* --- 4. Modbus 寄存器同步 (100ms) --- */
         if (now - g_last_sync_tick >= SYNC_MODBUS_MS) {
             ModbusTCP_SyncFromCAN();
             g_last_sync_tick = now;
         }
 
-        /* --- 5. Modbus TCP 请求处理 --- */
         ModbusTCP_Process();
 
-        /* --- 6. OLED 刷新 (300ms) --- */
         if (now - g_last_oled_tick >= OLED_UPDATE_MS) {
             OLED_UpdateDisplay();
             g_last_oled_tick = now;
         }
-
-        /* --- 7. 简单看门狗喂狗 (如果启用了 IWDG) --- */
-        /*  (当前阶段未用硬件看门狗) */
     }
 }
