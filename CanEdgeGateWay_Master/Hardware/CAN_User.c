@@ -26,7 +26,7 @@ SemaphoreHandle_t   g_can_fifo_not_empty  = NULL;
 SemaphoreHandle_t   g_can_monitor_sem     = NULL;
 
 /* ---- ISR → task shared frame buffer ---- */
-static CanRxFrame   g_isr_rx_frame;
+CanRxFrame          g_isr_rx_frame;
 static volatile BaseType_t g_rx_higher_prio_woken = pdFALSE;
 
 /* ---- Load calculation ---- */
@@ -131,18 +131,21 @@ void CAN_User_Init(void)
     filter.CAN_FilterActivation       = ENABLE;
     CAN_FilterInit(&filter);
 
-    CAN_ITConfig(CAN1, CAN_IT_FMP0, ENABLE);
-    CAN_ITConfig(CAN1, CAN_IT_ERR, ENABLE);
-    CAN_ITConfig(CAN1, CAN_IT_BOF, ENABLE);
-    CAN_NVIC_Init();
-
-    /* Create FreeRTOS sync objects */
+    /* Create FreeRTOS sync objects FIRST — before enabling ANY CAN interrupt.
+     * If an ISR fires before its semaphore is created, xSemaphoreGiveFromISR
+     * receives NULL → configASSERT → infinite loop.  (freertos_standard.md §13) */
     g_can_rx_sem         = xSemaphoreCreateBinary();
     g_can_fifo_not_empty = xSemaphoreCreateBinary();
     g_can_monitor_sem    = xSemaphoreCreateBinary();
 
-    /* FIFO init */
+    /* FIFO init (creates mutexes — must also be done before interrupts) */
     FIFO_Init();
+
+    /* THEN enable CAN interrupts (ISRs will find valid semaphore handles) */
+    CAN_ITConfig(CAN1, CAN_IT_FMP0, ENABLE);
+    CAN_ITConfig(CAN1, CAN_IT_ERR, ENABLE);
+    CAN_ITConfig(CAN1, CAN_IT_BOF, ENABLE);
+    CAN_NVIC_Init();
 
     /* Init slave node records */
     for (i = 0; i < MAX_SLAVE_NODES; i++) {
@@ -347,15 +350,11 @@ void CAN_ProcessFrame(CanRxFrame *p)
         FIFO_Normal_Push(p);
     }
 
-    /* Wake CAN Tx task */
-    static BaseType_t tx_woken = pdFALSE;
-    xSemaphoreGiveFromISR(g_can_fifo_not_empty, &tx_woken);
-    /* Note: not in ISR context here, but safe to call */
-    {
-        BaseType_t w = pdFALSE;
-        xSemaphoreGive(g_can_fifo_not_empty);
-        (void)w;
-    }
+    /* Wake CAN Tx task — NOTE: CAN_ProcessFrame runs in TASK context (Task_CAN_Rx).
+     * Use xSemaphoreGive(), NOT xSemaphoreGiveFromISR().
+     * FromISR writes to scheduler event lists without proper locking in task context,
+     * corrupting the scheduler state and causing system hang.  (freertos_standard.md §15) */
+    xSemaphoreGive(g_can_fifo_not_empty);
 }
 
 /* ==================== Heartbeat check (called from vTask_CAN_Monitor) ==================== */

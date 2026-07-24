@@ -15,8 +15,8 @@
 
 #include "stm32f10x.h"
 #include <stdint.h>
-#include "FreeRTOS.h"
-#include "semphr.h"
+#include "../FreeRTOS/inc/FreeRTOS.h"
+#include "../FreeRTOS/inc/semphr.h"
 #include "fifo.h"
 
 /* ---- CAN ID bases ---- */

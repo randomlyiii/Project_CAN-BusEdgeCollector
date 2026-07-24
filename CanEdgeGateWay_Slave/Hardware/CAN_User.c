@@ -2,7 +2,7 @@
  * CAN User Layer — Slave Phase 2
  *
  * ISR → semaphore → task pipeline.
- * Added BH1750 light sensor frame support + local cache integration.
+ * Added LM393 light sensor frame support + local cache integration.
  */
 
 #include "CAN_User.h"
@@ -80,11 +80,12 @@ void CAN_User_Init(void)
     filter.CAN_FilterActivation       = ENABLE;
     CAN_FilterInit(&filter);
 
+    /* Create semaphore FIRST — before enabling CAN interrupt */
+    g_can_rx_sem = xSemaphoreCreateBinary();
+
+    /* Then enable CAN interrupt (ISR will find valid semaphore handle) */
     CAN_ITConfig(CAN1, CAN_IT_FMP0, ENABLE);
     CAN_NVIC_Init();
-
-    /* Create semaphore */
-    g_can_rx_sem = xSemaphoreCreateBinary();
 
     /* Init local cache */
     LocalCache_Init(&g_local_cache);

@@ -3,7 +3,7 @@
  *
  * Changes from Phase 1:
  *   - ISR simplified: read frame + signal semaphore
- *   - Added BH1750 light sensor frame (CAN_FUNC_LIGHT, ID 0x300+node)
+ *   - Added LM393 light sensor frame (CAN_FUNC_LIGHT, ID 0x300+node)
  *   - Local cache for CAN-offline fault tolerance
  */
 
@@ -12,8 +12,8 @@
 
 #include "stm32f10x.h"
 #include <stdint.h>
-#include "FreeRTOS.h"
-#include "semphr.h"
+#include "../FreeRTOS/inc/FreeRTOS.h"
+#include "../FreeRTOS/inc/semphr.h"
 #include "local_cache.h"
 
 /* ---- CAN ID bases ---- */
