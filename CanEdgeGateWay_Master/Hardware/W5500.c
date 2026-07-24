@@ -1,388 +1,362 @@
+/**
+ * W5500 以太网驱动 (基于 Project_template 验证的 SPI 帧格式)
+ *
+ * 引脚: RST=PC15, SCS=PA4, SCK=PA5, MISO=PA6(AF_PP), MOSI=PA7
+ * SPI:  Mode0, 36MHz, FDM1读/VDM写, BSB仅在控制字节
+ */
 #include "W5500.h"
 #include "delay.h"
+#include "config.h"
 #include <string.h>
 
-/* ======================== 局部变量 ======================== */
-static uint8_t g_socket_status = SOCK_CLOSED;
-static uint8_t g_socket_mem[W5500_TCP_BUF_SIZE];   // TCP 收/发共享缓冲区
-static uint16_t g_tcp_rx_len = 0;                   // 待处理数据长度
+/* ===================== 全局状态 ===================== */
+RingBuf_t        g_w5500_rx_ring;
+volatile uint8_t g_w5500_online  = 0;
+uint8_t          g_w5500_version = 0;
 
-/* ======================== SPI 操作 ======================== */
+static uint8_t  g_socket_status   = SOCK_CLOSED;
+static uint8_t  g_chip_ok         = 0;
+static uint32_t g_close_wait_tick = 0;
+static uint32_t g_closed_tick     = 0;
+static uint8_t  g_phy_linked      = 0;
 
-/* SPI CS 控制 */
+/* ===================== SPI 控制字节 (模板验证) ===================== */
+#define T_VDM       0x00
+#define T_FDM1      0x01
+#define T_FDM2      0x02
+#define T_RWB_RD    0x00
+#define T_RWB_WR    0x04
+#define T_COMMON    0x00
+#define T_S0_REG    0x08
+#define T_S0_TXBUF  0x10
+#define T_S0_RXBUF  0x18
+
+/* ===================== CS 宏 ===================== */
 #define W5500_CS_LOW()   GPIO_ResetBits(W5500_SCS_PORT, W5500_SCS_PIN)
 #define W5500_CS_HIGH()  GPIO_SetBits(W5500_SCS_PORT, W5500_SCS_PIN)
 
-/* SPI 单字节读写 */
-static uint8_t SPI_ReadWriteByte(uint8_t tx)
+/* ===================== SPI 底层 ===================== */
+static void SPI_SendByte(uint8_t dat)
 {
+    SPI_I2S_SendData(W5500_SPI, dat);
     while (SPI_I2S_GetFlagStatus(W5500_SPI, SPI_I2S_FLAG_TXE) == RESET);
-    SPI_I2S_SendData(W5500_SPI, tx);
-    while (SPI_I2S_GetFlagStatus(W5500_SPI, SPI_I2S_FLAG_RXNE) == RESET);
-    return SPI_I2S_ReceiveData(W5500_SPI);
 }
+static void SPI_SendShort(uint16_t dat) { SPI_SendByte(dat>>8); SPI_SendByte(dat&0xFF); }
 
-/* ======================== W5500 寄存器读写 ======================== */
+/* ===================== 寄存器读写 ===================== */
 
-/**
-  * @brief  SPI 帧头构造 (Variable Length Data Mode)
-  *   Byte0: [Offset[15:13] | Block[4:3] | RW | OM[1:0]]
-  *           OM = 11 (可变长度模式)
-  *           RW = 0 (写) / 1 (读)
-  *   Byte1: Offset[12:5]  (中间 8 位)
-  *   Byte2: Offset[4:0] | Length[7:5]
-  *   Byte3: Length[4:0] (长度，对于单字节读写为 0x01)
-  */
-static void W5500_SPI_SendHeader(uint16_t addr, uint8_t rw, uint16_t len)
-{
-    uint8_t block = (addr >> 6) & 0x03;    // Block: bits[7:6] of addr → block 0-3
-    uint16_t offset = addr & 0x01FF;        // Offset: bits[8:0] of addr (within block)
-
-    /* Byte0: BSB[4:0] | RW | OM[1:0] */
-    uint8_t ctrl = (block << 3) | (rw << 2) | 0x03;  // OM = 11 (VDM)
-    SPI_ReadWriteByte(ctrl);
-
-    /* Byte1: Offset[15:8] 高 8 位 */
-    SPI_ReadWriteByte((uint8_t)(offset >> 8));
-
-    /* Byte2: Offset[7:0] 低 8 位 */
-    SPI_ReadWriteByte((uint8_t)(offset & 0xFF));
-
-    /* Byte3: 数据长度 (len-1 for VDM) */
-    SPI_ReadWriteByte((uint8_t)(len - 1));
-}
-
-/**
-  * @brief  读 1 字节寄存器
-  */
-uint8_t W5500_ReadByte(uint16_t addr)
+/* 通用寄存器读1字节: [AddrH][AddrL][Ctrl=FDM1|RD][Len=0][Data] */
+static uint8_t R_Common(uint16_t reg)
 {
     uint8_t val;
-
     W5500_CS_LOW();
-    W5500_SPI_SendHeader(addr, 1, 1);   // RW=1, len=1
-    val = SPI_ReadWriteByte(0xFF);
+    SPI_SendShort(reg);
+    SPI_SendByte(T_FDM1 | T_RWB_RD | T_COMMON);
+    SPI_I2S_ReceiveData(W5500_SPI);
+    SPI_SendByte(0x00);
+    val = (uint8_t)SPI_I2S_ReceiveData(W5500_SPI);
     W5500_CS_HIGH();
-
     return val;
 }
-
-/**
-  * @brief  写 1 字节寄存器
-  */
-void W5500_WriteByte(uint16_t addr, uint8_t val)
+/* 通用寄存器写1字节 */
+static void W_Common(uint16_t reg, uint8_t dat)
 {
     W5500_CS_LOW();
-    W5500_SPI_SendHeader(addr, 0, 1);   // RW=0, len=1
-    SPI_ReadWriteByte(val);
+    SPI_SendShort(reg);
+    SPI_SendByte(T_FDM1 | T_RWB_WR | T_COMMON);
+    SPI_SendByte(dat);
+    W5500_CS_HIGH();
+}
+/* 通用寄存器写N字节 (VDM) */
+static void W_CommonBuf(uint16_t reg, uint8_t *buf, uint16_t len)
+{
+    W5500_CS_LOW();
+    SPI_SendShort(reg);
+    SPI_SendByte(T_VDM | T_RWB_WR | T_COMMON);
+    for (uint16_t i = 0; i < len; i++) SPI_SendByte(buf[i]);
+    W5500_CS_HIGH();
+}
+/* Socket寄存器读1字节 */
+static uint8_t R_Sock(uint8_t sock, uint16_t reg)
+{
+    uint8_t val, bsb = (uint8_t)(sock * 0x20 + T_S0_REG);
+    W5500_CS_LOW();
+    SPI_SendShort(reg);
+    SPI_SendByte(T_FDM1 | T_RWB_RD | bsb);
+    SPI_I2S_ReceiveData(W5500_SPI);
+    SPI_SendByte(0x00);
+    val = (uint8_t)SPI_I2S_ReceiveData(W5500_SPI);
+    W5500_CS_HIGH();
+    return val;
+}
+/* Socket寄存器写1字节 */
+static void W_Sock(uint8_t sock, uint16_t reg, uint8_t dat)
+{
+    uint8_t bsb = (uint8_t)(sock * 0x20 + T_S0_REG);
+    W5500_CS_LOW(); SPI_SendShort(reg);
+    SPI_SendByte(T_FDM1 | T_RWB_WR | bsb); SPI_SendByte(dat);
+    W5500_CS_HIGH();
+}
+/* Socket寄存器读2字节 */
+static uint16_t R_Sock2(uint8_t sock, uint16_t reg)
+{
+    uint16_t val; uint8_t bsb = (uint8_t)(sock * 0x20 + T_S0_REG);
+    W5500_CS_LOW(); SPI_SendShort(reg);
+    SPI_SendByte(T_FDM2 | T_RWB_RD | bsb);
+    SPI_I2S_ReceiveData(W5500_SPI); SPI_SendByte(0x00);
+    val  = (uint16_t)SPI_I2S_ReceiveData(W5500_SPI) << 8;
+    SPI_SendByte(0x00); val |= SPI_I2S_ReceiveData(W5500_SPI);
+    W5500_CS_HIGH(); return val;
+}
+/* Socket寄存器写2字节 */
+static void W_Sock2(uint8_t sock, uint16_t reg, uint16_t dat)
+{
+    uint8_t bsb = (uint8_t)(sock * 0x20 + T_S0_REG);
+    W5500_CS_LOW(); SPI_SendShort(reg);
+    SPI_SendByte(T_FDM2 | T_RWB_WR | bsb); SPI_SendShort(dat);
+    W5500_CS_HIGH();
+}
+/* Socket Buffer读 (VDM) */
+static void R_SockBuf(uint8_t sock, uint8_t bsb_code, uint16_t off, uint8_t *buf, uint16_t len)
+{
+    uint8_t bsb = (uint8_t)(sock * 0x20 + bsb_code);
+    W5500_CS_LOW(); SPI_SendShort(off);
+    SPI_SendByte(T_VDM | T_RWB_RD | bsb);
+    SPI_I2S_ReceiveData(W5500_SPI);
+    for (uint16_t i = 0; i < len; i++) { SPI_SendByte(0x00); buf[i] = (uint8_t)SPI_I2S_ReceiveData(W5500_SPI); }
+    W5500_CS_HIGH();
+}
+/* Socket Buffer写 (VDM) */
+static void W_SockBuf(uint8_t sock, uint8_t bsb_code, uint16_t off, uint8_t *buf, uint16_t len)
+{
+    uint8_t bsb = (uint8_t)(sock * 0x20 + bsb_code);
+    W5500_CS_LOW(); SPI_SendShort(off);
+    SPI_SendByte(T_VDM | T_RWB_WR | bsb);
+    for (uint16_t i = 0; i < len; i++) SPI_SendByte(buf[i]);
     W5500_CS_HIGH();
 }
 
-/**
-  * @brief  读多字节寄存器
-  */
-void W5500_ReadBuf(uint16_t addr, uint8_t *buf, uint16_t len)
+/* ===================== 公共API (BSB映射) ===================== */
+uint8_t W5500_ReadByte(uint8_t bsb, uint16_t off)
 {
-    if (len == 0) return;
-
-    W5500_CS_LOW();
-    W5500_SPI_SendHeader(addr, 1, len);
-    for (uint16_t i = 0; i < len; i++)
-        buf[i] = SPI_ReadWriteByte(0xFF);
-    W5500_CS_HIGH();
+    if (bsb == BSB_COMMON)    return R_Common(off);
+    if (bsb == BSB_SOCK0_REG) return R_Sock(0, off);
+    return R_Sock(bsb - 1, off);
+}
+void W5500_WriteByte(uint8_t bsb, uint16_t off, uint8_t val)
+{
+    if (bsb == BSB_COMMON)    { W_Common(off, val); return; }
+    if (bsb == BSB_SOCK0_REG) { W_Sock(0, off, val); return; }
+    W_Sock(bsb - 1, off, val);
+}
+void W5500_ReadBuf(uint8_t bsb, uint16_t off, uint8_t *buf, uint16_t len)
+{
+    if (!len) return;
+    if (bsb == BSB_SOCK0_RX) { R_SockBuf(0, T_S0_RXBUF, off, buf, len); return; }
+    for (uint16_t i = 0; i < len; i++) buf[i] = W5500_ReadByte(bsb, off + i);
+}
+void W5500_WriteBuf(uint8_t bsb, uint16_t off, uint8_t *buf, uint16_t len)
+{
+    if (!len) return;
+    if (bsb == BSB_SOCK0_TX) { W_SockBuf(0, T_S0_TXBUF, off, buf, len); return; }
+    if (bsb == BSB_COMMON)   { W_CommonBuf(off, buf, len); return; }
+    for (uint16_t i = 0; i < len; i++) W5500_WriteByte(bsb, off + i, buf[i]);
 }
 
-/**
-  * @brief  写多字节寄存器
-  */
-void W5500_WriteBuf(uint16_t addr, uint8_t *buf, uint16_t len)
-{
-    if (len == 0) return;
-
-    W5500_CS_LOW();
-    W5500_SPI_SendHeader(addr, 0, len);
-    for (uint16_t i = 0; i < len; i++)
-        SPI_ReadWriteByte(buf[i]);
-    W5500_CS_HIGH();
-}
-
-/* ======================== 网络配置默认值 ======================== */
-
-/* MAC 地址 (可自定义, 需唯一) */
-static const uint8_t g_mac_addr[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
-/* IP: 192.168.1.100 */
-static const uint8_t g_ip_addr[4] = {192, 168, 1, 100};
-/* 子网掩码: 255.255.255.0 */
-static const uint8_t g_subnet[4] = {255, 255, 255, 0};
-/* 网关: 192.168.1.1 */
-static const uint8_t g_gw_addr[4] = {192, 168, 1, 1};
-
-/* ======================== 硬件初始化 ======================== */
-
-/**
-  * @brief  SPI1 初始化
-  */
-static void W5500_SPI_Init(void)
-{
-    GPIO_InitTypeDef gpio;
-    SPI_InitTypeDef   spi;
-
-    RCC_APB2PeriphClockCmd(W5500_SPI_GPIO_RCC | W5500_SPI_RCC, ENABLE);
-
-    /* PA5 SCK, PA7 MOSI → 复用推挽 */
-    gpio.GPIO_Pin   = GPIO_Pin_5 | GPIO_Pin_7;
-    gpio.GPIO_Mode  = GPIO_Mode_AF_PP;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(GPIOA, &gpio);
-
-    /* PA6 MISO → 浮空输入 */
-    gpio.GPIO_Pin   = GPIO_Pin_6;
-    gpio.GPIO_Mode  = GPIO_Mode_IN_FLOATING;
-    GPIO_Init(GPIOA, &gpio);
-
-    /* SPI1 配置: 主机模式, 2 线全双工, 8MHz (72MHz / 9 = 8MHz) */
-    SPI_I2S_DeInit(SPI1);
-    spi.SPI_Direction         = SPI_Direction_2Lines_FullDuplex;
-    spi.SPI_Mode              = SPI_Mode_Master;
-    spi.SPI_DataSize          = SPI_DataSize_8b;
-    spi.SPI_CPOL              = SPI_CPOL_Low;
-    spi.SPI_CPHA              = SPI_CPHA_1Edge;
-    spi.SPI_NSS               = SPI_NSS_Soft;
-    spi.SPI_BaudRatePrescaler = SPI_BaudRatePrescaler_9;  // 72/9 = 8MHz
-    spi.SPI_FirstBit          = SPI_FirstBit_MSB;
-    spi.SPI_CRCPolynomial     = 7;
-    SPI_Init(SPI1, &spi);
-    SPI_Cmd(SPI1, ENABLE);
-}
-
-/**
-  * @brief  W5500 复位引脚与 CS 引脚初始化
-  */
+/* ===================== GPIO + SPI 初始化 ===================== */
 static void W5500_GPIO_Init(void)
 {
     GPIO_InitTypeDef gpio;
-
-    RCC_APB2PeriphClockCmd(W5500_RST_RCC | W5500_SCS_RCC, ENABLE);
-
-    /* PA3 RST */
-    gpio.GPIO_Pin   = W5500_RST_PIN;
-    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+    gpio.GPIO_Pin = W5500_RST_PIN; gpio.GPIO_Speed = GPIO_Speed_10MHz;
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
     GPIO_Init(W5500_RST_PORT, &gpio);
-
-    /* PA4 SCS */
-    gpio.GPIO_Pin   = W5500_SCS_PIN;
-    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(W5500_SCS_PORT, &gpio);
-
-    /* 初始状态: 复位高, CS 高 */
-    GPIO_SetBits(W5500_RST_PORT, W5500_RST_PIN);
-    GPIO_SetBits(W5500_SCS_PORT, W5500_SCS_PIN);
+    GPIO_ResetBits(W5500_RST_PORT, W5500_RST_PIN);
 }
 
-/* ======================== W5500 初始化 ======================== */
+static void W5500_SPI_Init(void)
+{
+    GPIO_InitTypeDef gpio; SPI_InitTypeDef spi;
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_SPI1 | RCC_APB2Periph_AFIO, ENABLE);
 
-void W5500_Init(void)
+    gpio.GPIO_Pin = GPIO_Pin_5 | GPIO_Pin_6 | GPIO_Pin_7;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz; gpio.GPIO_Mode = GPIO_Mode_AF_PP;
+    GPIO_Init(GPIOA, &gpio);
+    GPIO_SetBits(GPIOA, GPIO_Pin_5 | GPIO_Pin_6 | GPIO_Pin_7);
+
+    gpio.GPIO_Pin = W5500_SCS_PIN; gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_Init(W5500_SCS_PORT, &gpio);
+    GPIO_SetBits(W5500_SCS_PORT, W5500_SCS_PIN);
+
+    spi.SPI_Direction = SPI_Direction_2Lines_FullDuplex;
+    spi.SPI_Mode = SPI_Mode_Master; spi.SPI_DataSize = SPI_DataSize_8b;
+    spi.SPI_CPOL = SPI_CPOL_Low; spi.SPI_CPHA = SPI_CPHA_1Edge;
+    spi.SPI_NSS = SPI_NSS_Soft; spi.SPI_BaudRatePrescaler = SPI_BaudRatePrescaler_2;
+    spi.SPI_FirstBit = SPI_FirstBit_MSB; spi.SPI_CRCPolynomial = 7;
+    SPI_Init(SPI1, &spi); SPI_Cmd(SPI1, ENABLE);
+}
+
+/* ===================== 初始化 (仅硬件, 网络参数由 ConfigNetwork 负责) ===================== */
+int8_t W5500_Init(void)
 {
     uint8_t ver;
+    W5500_GPIO_Init(); W5500_SPI_Init();
 
-    W5500_GPIO_Init();
-    W5500_SPI_Init();
+    GPIO_ResetBits(W5500_RST_PORT, W5500_RST_PIN); Delay_ms(50);
+    GPIO_SetBits(W5500_RST_PORT, W5500_RST_PIN);   Delay_ms(200);
 
-    /* 硬件复位: RST 拉低 10us 后释放 */
-    GPIO_ResetBits(W5500_RST_PORT, W5500_RST_PIN);
-    Delay_us(10);
-    GPIO_SetBits(W5500_RST_PORT, W5500_RST_PIN);
-    Delay_ms(50);   // 等待 W5500 内部初始化完成
+    RingBuf_Init(&g_w5500_rx_ring);
+    g_socket_status = SOCK_CLOSED; g_chip_ok = g_w5500_online = g_phy_linked = 0;
+    g_w5500_version = 0;
 
-    /* 检查版本寄存器 (0x4 表示 W5500) */
-    ver = W5500_ReadByte(REG_VERSIONR);
-    (void)ver;  // 实际调试时可验证 ver == 0x04
+    W_Common(REG_MR, 0x80); Delay_ms(10);     /* 软件复位 */
+    ver = R_Common(REG_VERSIONR);              /* 读版本号 */
+    g_w5500_version = ver;
+    if (ver != 0x04) return W5500_ERR_SPI;
 
-    g_socket_status = SOCK_CLOSED;
-    g_tcp_rx_len = 0;
+    g_chip_ok = 1;
+
+    /* Socket0 buf=2KB, 重传2000/200ms, 次数8, 关中断 */
+    W_Sock(0, 0x001E, 0x02); W_Sock(0, 0x001F, 0x02);
+    { uint8_t r[2]={0x07,0xD0}; W_CommonBuf(0x0019, r, 2); }
+    W_Common(0x001B, 8);
+    W_Common(REG_IMR, 0x00); W_Common(REG_IR, 0xFF);
+    return W5500_OK;
 }
 
-void W5500_ConfigNetwork(void)
+uint8_t W5500_IsOnline(void) { return g_chip_ok; }
+
+/* ===================== 网络配置 ===================== */
+static uint8_t g_mac[6] = W5500_CFG_MAC;
+static uint8_t g_ip[4]  = W5500_CFG_IP;
+static uint8_t g_sub[4] = W5500_CFG_SUB;
+static uint8_t g_gw[4]  = W5500_CFG_GW;
+
+int8_t W5500_ConfigNetwork(void)
 {
-    /* 配置 MAC 地址 */
-    W5500_WriteBuf(REG_SHAR, (uint8_t*)g_mac_addr, 6);
+    if (!g_chip_ok) return W5500_ERR_SPI;
 
-    /* 配置 IP 地址 */
-    W5500_WriteBuf(REG_SIPR, (uint8_t*)g_ip_addr, 4);
+    W_CommonBuf(REG_GAR,  g_gw,  4);
+    W_CommonBuf(REG_SUBR, g_sub, 4);
+    W_CommonBuf(REG_SHAR, g_mac, 6);
+    W_CommonBuf(REG_SIPR, g_ip,  4);
 
-    /* 配置子网掩码 */
-    W5500_WriteBuf(REG_SUBR, (uint8_t*)g_subnet, 4);
-
-    /* 配置网关 */
-    W5500_WriteBuf(REG_GAR, (uint8_t*)g_gw_addr, 4);
+    /* 验证: MAC首字节非0 */
+    if (R_Common(REG_SHAR) == 0 && R_Common(REG_SHAR+1) == 0)
+        return W5500_ERR_SPI;
+    return W5500_OK;
 }
 
-/* ======================== TCP Server ======================== */
-
-void W5500_TCPServer_Start(uint16_t port)
+int8_t W5500_SetNetParam(uint8_t *mac, uint8_t *ip, uint8_t *sub, uint8_t *gw)
 {
-    /* 关闭 Socket 0 (确保初始状态) */
-    W5500_WriteByte(REG_SN_CR(0), Sn_CR_CLOSE);
-    Delay_ms(10);
+    if (mac) { memcpy(g_mac, mac, 6); W_CommonBuf(REG_SHAR, mac, 6); }
+    if (ip)  { memcpy(g_ip,  ip,  4); W_CommonBuf(REG_SIPR, ip,  4); }
+    if (sub) { memcpy(g_sub, sub, 4); W_CommonBuf(REG_SUBR, sub, 4); }
+    if (gw)  { memcpy(g_gw,  gw,  4); W_CommonBuf(REG_GAR,  gw,  4); }
+    return W5500_OK;
+}
 
-    /* 设置 Socket 模式为 TCP */
-    W5500_WriteByte(REG_SN_MR(0), Sn_MR_TCP);
+uint8_t W5500_LinkUp(void) { return (R_Common(REG_PHYCFGR) & 0x01) ? 1 : 0; }
 
-    /* 设置端口 (大端) */
-    W5500_WriteByte(REG_SN_PORT(0), (uint8_t)(port >> 8));
-    W5500_WriteByte(REG_SN_PORT(0) + 1, (uint8_t)(port & 0xFF));
+/* ===================== Socket ===================== */
+static int8_t SocketCmd(uint8_t sock, uint8_t cmd, uint8_t expect_sr)
+{
+    uint32_t to = (uint32_t)SOCK_CMD_TIMEOUT_MS * 1000;
+    W_Sock(sock, OFF_SN_CR, cmd);
+    while (--to) {
+        uint8_t sr = R_Sock(sock, OFF_SN_SR);
+        if (sr == expect_sr) { g_socket_status = sr; return W5500_OK; }
+        if (sr == SOCK_CLOSED && expect_sr != SOCK_CLOSED) break;
+        Delay_us(100);
+    }
+    g_socket_status = R_Sock(sock, OFF_SN_SR);
+    return W5500_ERR_TIMEOUT;
+}
 
-    /* 打开 Socket */
-    W5500_WriteByte(REG_SN_CR(0), Sn_CR_OPEN);
-    Delay_ms(5);
-
-    /* 监听 */
-    W5500_WriteByte(REG_SN_CR(0), Sn_CR_LISTEN);
-    Delay_ms(5);
-
-    g_socket_status = SOCK_LISTEN;
+/* ===================== TCP Server ===================== */
+int8_t W5500_TCPServer_Start(uint16_t port)
+{
+    if (!g_chip_ok) return W5500_ERR_SPI;
+    W_Sock2(0, OFF_SN_PORT, port);
+    W_Sock(0, OFF_SN_MR, 0x01);
+    if (SocketCmd(0, Sn_CR_OPEN, SOCK_INIT))   return W5500_ERR_TIMEOUT;
+    if (SocketCmd(0, Sn_CR_LISTEN, SOCK_LISTEN)) return W5500_ERR_TIMEOUT;
+    return W5500_OK;
 }
 
 void W5500_TCPServer_Run(void)
 {
-    uint8_t sr;
-
-    sr = W5500_ReadByte(REG_SN_SR(0));
-    g_socket_status = sr;
+    if (!g_chip_ok) return;
+    uint8_t sr = R_Sock(0, OFF_SN_SR);
+    g_socket_status = sr; g_phy_linked = W5500_LinkUp();
 
     switch (sr) {
     case SOCK_ESTABLISHED: {
-        /* 检查是否有数据到达 */
-        uint16_t rx_size;
-        uint8_t size_h, size_l;
-
-        size_h  = W5500_ReadByte(REG_SN_RX_RSR(0));
-        size_l  = W5500_ReadByte(REG_SN_RX_RSR(0) + 1);
-        rx_size = ((uint16_t)size_h << 8) | size_l;
-
-        if (rx_size > 0) {
-            if (rx_size > W5500_TCP_BUF_SIZE)
-                rx_size = W5500_TCP_BUF_SIZE;
-            W5500_ReceiveData(g_socket_mem);
-            g_tcp_rx_len = rx_size;
+        g_w5500_online = 1; g_close_wait_tick = g_closed_tick = 0;
+        uint16_t rx_sz = R_Sock2(0, OFF_SN_RX_RSR);
+        if (rx_sz > 0) {
+            uint16_t rd = R_Sock2(0, OFF_SN_RX_RD);
+            uint16_t room = W5500_RX_BUF_SIZE - g_w5500_rx_ring.count;
+            if (rx_sz > room) rx_sz = room; if (rx_sz > 512) rx_sz = 512;
+            if (rx_sz > 0) {
+                uint8_t tmp[512];
+                R_SockBuf(0, T_S0_RXBUF, rd & 0x7FF, tmp, rx_sz);
+                rd += rx_sz; W_Sock2(0, OFF_SN_RX_RD, rd);
+                SocketCmd(0, Sn_CR_RECV, SOCK_ESTABLISHED);
+                RingBuf_Push(&g_w5500_rx_ring, tmp, rx_sz);
+            }
         }
         break;
     }
-
     case SOCK_CLOSE_WAIT:
-        /* 客户端断开, 发送断开命令后重新监听 */
-        W5500_WriteByte(REG_SN_CR(0), Sn_CR_DISCON);
-        Delay_ms(1);
-        W5500_WriteByte(REG_SN_CR(0), Sn_CR_CLOSE);
-        Delay_ms(5);
-        W5500_TCPServer_Start(MODBUS_PORT);
+        if (Delay_GetTick() - g_close_wait_tick > 1000) {
+            g_close_wait_tick = Delay_GetTick();
+            SocketCmd(0, Sn_CR_DISCON, SOCK_CLOSED);
+            SocketCmd(0, Sn_CR_CLOSE, SOCK_CLOSED);
+        }
         break;
-
     case SOCK_CLOSED:
-        /* Socket 关闭, 重新开启 */
-        Delay_ms(10);
-        W5500_TCPServer_Start(MODBUS_PORT);
-        break;
-
-    default:
+        g_w5500_online = 0;
+        if (Delay_GetTick() - g_closed_tick > 3000)
+            { g_closed_tick = Delay_GetTick(); W5500_TCPServer_Start(MODBUS_PORT); }
         break;
     }
 }
 
-uint16_t W5500_ReceiveData(uint8_t *buf)
-{
-    uint16_t rx_size;
-    uint16_t rx_rd;
-    uint8_t rx_rd_h, rx_rd_l;
-
-    /* 获取接收数据大小 */
-    uint8_t h = W5500_ReadByte(REG_SN_RX_RSR(0));
-    uint8_t l = W5500_ReadByte(REG_SN_RX_RSR(0) + 1);
-    rx_size = ((uint16_t)h << 8) | l;
-
-    if (rx_size == 0) return 0;
-    if (rx_size > W5500_TCP_BUF_SIZE)
-        rx_size = W5500_TCP_BUF_SIZE;
-
-    /* 获取 RX 读指针 */
-    rx_rd_h = W5500_ReadByte(REG_SN_RX_RD(0));
-    rx_rd_l = W5500_ReadByte(REG_SN_RX_RD(0) + 1);
-    rx_rd   = ((uint16_t)rx_rd_h << 8) | rx_rd_l;
-
-    /* 从 RX buffer 读取数据 */
-    W5500_ReadBuf(RX_BUF_BASE + rx_rd, buf, rx_size);
-
-    /* 更新 RX 读指针 */
-    rx_rd += rx_size;
-    W5500_WriteByte(REG_SN_RX_RD(0), (uint8_t)(rx_rd >> 8));
-    W5500_WriteByte(REG_SN_RX_RD(0) + 1, (uint8_t)(rx_rd & 0xFF));
-
-    /* 发送 RECV 命令 */
-    W5500_WriteByte(REG_SN_CR(0), Sn_CR_RECV);
-
-    return rx_size;
-}
-
-void W5500_SendData(uint8_t *buf, uint16_t len)
-{
-    uint16_t tx_wr;
-    uint16_t free_size;
-    uint8_t free_h, free_l;
-    uint8_t tx_wr_h, tx_wr_l;
-
-    if (len == 0) return;
-    if (g_socket_status != SOCK_ESTABLISHED) return;
-
-    /* 等待 TX 缓冲区有空闲 */
-    uint32_t timeout = 1000;  // ~10ms
-    do {
-        free_h = W5500_ReadByte(REG_SN_TX_FSR(0));
-        free_l = W5500_ReadByte(REG_SN_TX_FSR(0) + 1);
-        free_size = ((uint16_t)free_h << 8) | free_l;
-        if (free_size >= len) break;
-        Delay_us(10);
-    } while (timeout--);
-
-    if (free_size < len) return;  // 超时
-
-    /* 获取 TX 写指针 */
-    tx_wr_h = W5500_ReadByte(REG_SN_TX_WR(0));
-    tx_wr_l = W5500_ReadByte(REG_SN_TX_WR(0) + 1);
-    tx_wr   = ((uint16_t)tx_wr_h << 8) | tx_wr_l;
-
-    /* 写入 TX buffer */
-    W5500_WriteBuf(TX_BUF_BASE + tx_wr, buf, len);
-
-    /* 更新 TX 写指针 */
-    tx_wr += len;
-    W5500_WriteByte(REG_SN_TX_WR(0), (uint8_t)(tx_wr >> 8));
-    W5500_WriteByte(REG_SN_TX_WR(0) + 1, (uint8_t)(tx_wr & 0xFF));
-
-    /* 发送 SEND 命令 */
-    W5500_WriteByte(REG_SN_CR(0), Sn_CR_SEND);
-}
-
 uint8_t W5500_IsConnected(void)
+    { return (g_socket_status == SOCK_ESTABLISHED && g_w5500_online) ? 1 : 0; }
+
+/* ===================== 发送数据 ===================== */
+int8_t W5500_SendData(uint8_t *buf, uint16_t len)
 {
-    return (g_socket_status == SOCK_ESTABLISHED) ? 1 : 0;
+    if (!len) return W5500_OK;
+    if (!buf || len > 1460) return W5500_ERR_PARAM;
+    if (!g_w5500_online || g_socket_status != SOCK_ESTABLISHED) return W5500_ERR_NOCONN;
+
+    uint32_t to = 10000; uint16_t free_sz;
+    do { free_sz = R_Sock2(0, OFF_SN_TX_FSR); if (free_sz >= len) break; Delay_us(100); } while (--to);
+    if (free_sz < len) return W5500_ERR_TIMEOUT;
+
+    uint16_t wr = R_Sock2(0, OFF_SN_TX_WR);
+    W_SockBuf(0, T_S0_TXBUF, wr & 0x7FF, buf, len);
+    wr += len; W_Sock2(0, OFF_SN_TX_WR, wr);
+    if (SocketCmd(0, Sn_CR_SEND, SOCK_ESTABLISHED)) return W5500_ERR_TIMEOUT;
+    return W5500_OK;
 }
 
-/**
-  * @brief  获取接收缓冲区指针
-  */
-uint8_t* W5500_GetRxBuf(void)
-{
-    return g_socket_mem;
+/* ===================== 环形缓冲 ===================== */
+void RingBuf_Init(RingBuf_t *r)   { r->head=r->tail=r->count=0; }
+uint16_t RingBuf_Available(RingBuf_t *r) { return r->count; }
+int8_t RingBuf_Push(RingBuf_t *r, uint8_t *d, uint16_t n) {
+    if (r->count+n > W5500_RX_BUF_SIZE) return W5500_ERR_PARAM;
+    for (uint16_t i=0;i<n;i++){r->buf[r->head]=d[i];r->head=(r->head+1)%W5500_RX_BUF_SIZE;}
+    r->count+=n; return W5500_OK;
 }
-
-uint16_t W5500_GetRxLen(void)
-{
-    return g_tcp_rx_len;
+int16_t RingBuf_Pop(RingBuf_t *r, uint8_t *o, uint16_t m) {
+    if (!r->count||!m) return 0;
+    uint16_t n=(r->count<m)?r->count:m;
+    for (uint16_t i=0;i<n;i++){o[i]=r->buf[r->tail];r->tail=(r->tail+1)%W5500_RX_BUF_SIZE;}
+    r->count-=n; return (int16_t)n;
 }
-
-void W5500_ClrRxLen(void)
-{
-    g_tcp_rx_len = 0;
-}
+void RingBuf_Clear(RingBuf_t *r) { r->head=r->tail=r->count=0; }
