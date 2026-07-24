@@ -1,123 +1,331 @@
+/**
+ * CAN Edge Gateway Master — Phase 2 (FreeRTOS)
+ *
+ * 6-task architecture:
+ *   vTask_CAN_Rx (prio 5):    ISR→semaphore→FIFO
+ *   vTask_CAN_Monitor (prio 4): bus load, error state, escalation
+ *   vTask_CAN_Tx (prio 3):    FIFO→CAN transmit
+ *   vTask_Protocol (prio 2):  CAN↔Modbus sync, cache, batch upload
+ *   vTask_W5500 (prio 1):     TCP server, Modbus processing
+ *   vTask_Housekeep (prio 0): watchdog, stack monitor, logs
+ */
+
 #include "stm32f10x.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
 #include "delay.h"
 #include "oled.h"
 #include "CAN_User.h"
 #include "W5500.h"
 #include "ModbusTCP.h"
+#include "fifo.h"
+#include "stm32f10x_iwdg.h"
 #include <stdio.h>
 #include <string.h>
 
+/* ---- Semihosting ---- */
 #pragma import(__use_no_semihosting_swi)
 struct __FILE { int handle; };
 FILE __stdout = {0};
 void _sys_exit(int x) { x = x; }
 
-static char     g_oled_line[4][17];
-static uint32_t g_last_oled_tick    = 0;
-static uint32_t g_last_hbcheck_tick = 0;
-static uint32_t g_last_sync_tick    = 0;
+/* ---- Task handles ---- */
+static TaskHandle_t hTask_CAN_Rx     = NULL;
+static TaskHandle_t hTask_CAN_Monitor = NULL;
+static TaskHandle_t hTask_CAN_Tx     = NULL;
+static TaskHandle_t hTask_Protocol   = NULL;
+static TaskHandle_t hTask_W5500      = NULL;
+static TaskHandle_t hTask_Housekeep  = NULL;
 
-#define OLED_UPDATE_MS   300
-#define HB_CHECK_MS      200
-#define SYNC_MODBUS_MS   100
+/* ---- Task stack sizes ---- */
+#define STACK_CAN_RX        256
+#define STACK_CAN_MONITOR   256
+#define STACK_CAN_TX        256
+#define STACK_PROTOCOL      512
+#define STACK_W5500         512
+#define STACK_HOUSEKEEP     256
 
-void CAN_User_OnError(uint8_t level)      { (void)level; }
-void CAN_User_OnAlarm(uint8_t node_id, uint8_t func) { (void)node_id; (void)func; }
-void CAN_User_OnNodeUpdate(uint8_t node_id) { (void)node_id; }
+/* ---- OLED ---- */
+static char g_oled_line[4][17];
 
-/*
- * 获取以太网状态字符串
- *   "FAIL"=芯片异常  "NOLK"=无网线  "CON"=已连接
- *   "LSN"=监听中    "CLS"=已关闭    "SR:XX"=其他状态
- */
+/* ---- W5500 state ---- */
+static uint8_t g_eth_was_connected = 0;
+
+/* ==================== OLED helper ==================== */
+
+static const char *CAN_StateStr(void)
+{
+    switch (g_can_error.error_level) {
+    case 0:  return "OK ";
+    case 1:  return "WRN";
+    case 2:  return "ERR";
+    case 3:  return "BOF";
+    default: return "???";
+    }
+}
+
 static const char *ETH_StateStr(void)
 {
-    if (!W5500_IsOnline())                   return "FAIL";
-    if (!W5500_LinkUp())                     return "NOLK";
-    if (W5500_IsConnected())                 return "CON ";
-
-    uint8_t sr = W5500_ReadByte(BSB_SOCK0_REG, OFF_SN_SR);
-    if (sr == SOCK_LISTEN)                   return "LSN ";
-    if (sr == SOCK_CLOSED)                   return "CLS ";
-
-    static char buf[6];
-    sprintf(buf, "SR:%02X", sr);
-    return buf;
+    if (!W5500_IsOnline())   return "FAIL";
+    if (!W5500_LinkUp())     return "NOLK";
+    if (W5500_IsConnected()) return "CON ";
+    return "LSN ";
 }
 
 static void OLED_UpdateDisplay(void)
 {
     uint8_t online1 = g_slave_nodes[0].online;
     uint8_t fault1  = g_slave_nodes[0].fault_flag;
-    const char *can = (g_can_error.error_level == 0) ? "OK" : "ERR";
 
-    /* 第1行: CAN状态 + 以太网状态 */
-    sprintf(g_oled_line[0], "CAN:%-3s ETH:%-4s", can, ETH_StateStr());
+    /* Line 1: CAN state + Ethernet state */
+    sprintf(g_oled_line[0], "CAN:%-3s ETH:%-4s", CAN_StateStr(), ETH_StateStr());
 
-    /* 第2行: 从站1 温度 + 总线负载 */
+    /* Line 2: Slave 1 temperature + bus load */
     if (online1) {
-        uint16_t load = g_can_error.bus_load;  /* 0~10000 = 0.00%~100.00% */
+        uint16_t load = g_can_error.bus_load;
         if (load < 1000) {
-            /* <10%: 显示两位小数, 如 L:0.06% */
             sprintf(g_oled_line[1], "S1:%d.%dC L:%u.%02u%%",
                     g_slave_nodes[0].temp_int, g_slave_nodes[0].temp_dec,
                     load / 100, load % 100);
         } else {
-            /* >=10%: 四舍五入到一位小数, 节省1字符, 如 L:90.7% */
-            uint16_t r = (load + 5) / 10;  /* 0~1000, 单位0.1% */
-            if (r >= 1000) {
+            uint16_t r = (load + 5) / 10;
+            if (r >= 1000)
                 sprintf(g_oled_line[1], "S1:%d.%dC L:100%%",
                         g_slave_nodes[0].temp_int, g_slave_nodes[0].temp_dec);
-            } else {
+            else
                 sprintf(g_oled_line[1], "S1:%d.%dC L:%u.%u%%",
                         g_slave_nodes[0].temp_int, g_slave_nodes[0].temp_dec,
                         r / 10, r % 10);
-            }
         }
     } else
         sprintf(g_oled_line[1], "S1:--.-C L:--%% ");
 
-    /* 第3行: 湿度 + 心跳 */
+    /* Line 3: humidity + heartbeat */
     sprintf(g_oled_line[2], "H:%d.%d%% HB:%-5u",
             g_slave_nodes[0].humi_int, g_slave_nodes[0].humi_dec,
             g_slave_nodes[0].heartbeat_count);
 
-    /* 第4行: R=CAN帧 T=温湿度帧 + 状态 */
+    /* Line 4: CAN frame count + FIFO status + node state */
     {
-        char r_str[5], t_str[4];
+        char r_str[5];
         const char *status;
         uint32_t rx = g_can_rx_int_count;
-        uint32_t th = g_can_rx_temp_count;
+        uint8_t  hc = FIFO_High_Count();
+        uint8_t  nc = FIFO_Normal_Count();
 
-        if      (rx >= 1000000) sprintf(r_str, "%luM", rx/1000000);
+        if (rx >= 1000000)      sprintf(r_str, "%luM", rx/1000000);
         else if (rx >= 10000)   sprintf(r_str, "%luK", rx/1000);
         else if (rx >= 1000)    sprintf(r_str, "%lu.%luK", rx/1000, (rx%1000)/100);
-        else                    sprintf(r_str, "%lu", rx);
+        else                    sprintf(r_str, "%lu", (unsigned long)rx);
 
-        if      (th >= 1000000) sprintf(t_str, "%luM", th/1000000);
-        else if (th >= 10000)   sprintf(t_str, "%luK", th/1000);
-        else if (th >= 1000)    sprintf(t_str, "%lu.%luK", th/1000, (th%1000)/100);
-        else                    sprintf(t_str, "%lu", th);
-
-        if (!online1)               status = "OFF";
-        else if (fault1)            status = "ALM";
+        if (!online1)                status = "OFF";
+        else if (fault1)             status = "ALM";
         else if (g_slave_nodes[0].blacklist) status = "BLK";
-        else                        status = "OK ";
+        else                         status = "OK ";
 
-        sprintf(g_oled_line[3], "R%-4s T%-3s %-3s", r_str, t_str, status);
+        sprintf(g_oled_line[3], "R%-4s H:%-2u N:%-2u%s", r_str, hc, nc, status);
     }
 
-    uint8_t i;
-    for (i = 0; i < 4; i++) {
+    for (uint8_t i = 0; i < 4; i++) {
         g_oled_line[i][16] = '\0';
         OLED_ShowString(i + 1, 1, g_oled_line[i]);
     }
 }
 
+/* ==================== Task: CAN_Rx (priority 5) ==================== */
+
+static void Task_CAN_Rx(void *pvParameters)
+{
+    (void)pvParameters;
+    for (;;) {
+        /* Block until ISR signals new frame */
+        if (xSemaphoreTake(g_can_rx_sem, portMAX_DELAY) == pdPASS) {
+            CAN_ProcessFrame(&g_isr_rx_frame);
+        }
+    }
+}
+
+/* ==================== Task: CAN_Monitor (priority 4, 100ms) ==================== */
+
+static void Task_CAN_Monitor(void *pvParameters)
+{
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    (void)pvParameters;
+
+    for (;;) {
+        CAN_HeartBeatCheck();
+        CAN_ErrorMonitor();
+        CAN_CalcBusLoad();
+        CAN_CheckEscalation();
+        CAN_CheckDeescalation();
+
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100));
+    }
+}
+
+/* ==================== Task: CAN_Tx (priority 3) ==================== */
+
+static void Task_CAN_Tx(void *pvParameters)
+{
+    CanRxFrame frame;
+    (void)pvParameters;
+
+    for (;;) {
+        /* Wait for FIFO not empty */
+        if (xSemaphoreTake(g_can_fifo_not_empty, pdMS_TO_TICKS(10)) != pdPASS)
+            continue;
+
+        /* Drain FIFO: HIGH first, then NORMAL */
+        while (FIFO_High_Pop(&frame) == 0) {
+            /* Throttle check: in emergency mode, only allow priority-0 and heartbeat */
+            if (g_system_throttle_level >= 2) {
+                uint8_t func = frame.Data[CAN_DATA_FUNC_IDX];
+                uint8_t prio = frame.Data[CAN_DATA_TYPE_IDX];
+                if (prio != 0 && func != CAN_FUNC_HEARTBEAT)
+                    continue;  /* Drop non-emergency, non-heartbeat frames */
+            }
+            CAN_SendFrame(frame.StdId, frame.Data, frame.DLC);
+        }
+        while (FIFO_Normal_Pop(&frame) == 0) {
+            if (g_system_throttle_level >= 2) {
+                uint8_t func = frame.Data[CAN_DATA_FUNC_IDX];
+                uint8_t prio = frame.Data[CAN_DATA_TYPE_IDX];
+                if (prio != 0 && func != CAN_FUNC_HEARTBEAT)
+                    continue;
+            }
+            CAN_SendFrame(frame.StdId, frame.Data, frame.DLC);
+        }
+    }
+}
+
+/* ==================== Task: Protocol (priority 2, 50ms) ==================== */
+
+static void Task_Protocol(void *pvParameters)
+{
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    (void)pvParameters;
+
+    for (;;) {
+        ModbusTCP_SyncFromCAN();
+
+        /* Check link state for connect/disconnect events */
+        if (W5500_IsConnected()) {
+            if (!g_eth_was_connected) {
+                ModbusTCP_OnReconnect();
+                g_eth_was_connected = 1;
+            }
+        } else {
+            if (g_eth_was_connected) {
+                ModbusTCP_OnDisconnect();
+                g_eth_was_connected = 0;
+            }
+        }
+
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(50));
+    }
+}
+
+/* ==================== Task: W5500 (priority 1) ==================== */
+
+static void Task_W5500(void *pvParameters)
+{
+    (void)pvParameters;
+
+    /* Wait for network init before starting the TCP server */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    W5500_TCPServer_Start(MODBUS_PORT);
+
+    for (;;) {
+        /* Critical section for SPI integrity */
+        taskENTER_CRITICAL();
+        W5500_TCPServer_Run();
+        taskEXIT_CRITICAL();
+
+        taskENTER_CRITICAL();
+        ModbusTCP_Process();
+        taskEXIT_CRITICAL();
+
+        vTaskDelay(pdMS_TO_TICKS(5));  /* ~200 polls/sec */
+    }
+}
+
+/* ==================== Task: Housekeep (priority 0, 1s) ==================== */
+
+static void Task_Housekeep(void *pvParameters)
+{
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    (void)pvParameters;
+
+    /* Initialize IWDG: ~1s timeout */
+    IWDG_WriteAccessCmd(IWDG_WriteAccess_Enable);
+    IWDG_SetPrescaler(IWDG_Prescaler_64);     /* 40kHz / 64 = 625Hz */
+    IWDG_SetReload(625);                       /* 625 / 625 = 1s */
+    IWDG_ReloadCounter();
+    IWDG_Enable();
+
+    for (;;) {
+        IWDG_ReloadCounter();
+
+        /* Stack high-water checks (log via USART1 if available) */
+        {
+            UBaseType_t stacks[6];
+            stacks[0] = uxTaskGetStackHighWaterMark(hTask_CAN_Rx);
+            stacks[1] = uxTaskGetStackHighWaterMark(hTask_CAN_Monitor);
+            stacks[2] = uxTaskGetStackHighWaterMark(hTask_CAN_Tx);
+            stacks[3] = uxTaskGetStackHighWaterMark(hTask_Protocol);
+            stacks[4] = uxTaskGetStackHighWaterMark(hTask_W5500);
+            stacks[5] = uxTaskGetStackHighWaterMark(hTask_Housekeep);
+
+            /* If any task has less than 20% stack remaining, log warning */
+            for (uint8_t i = 0; i < 6; i++) {
+                if (stacks[i] < 50) {
+                    /* USART1 log: task stack low */
+                    (void)stacks[i];  /* TODO: log to USART1 */
+                }
+            }
+        }
+
+        /* Update OLED */
+        OLED_UpdateDisplay();
+
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
+    }
+}
+
+/* ==================== Stack overflow hook ==================== */
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    (void)xTask;
+    (void)pcTaskName;
+    /* Critical: task stack overflow detected */
+    taskDISABLE_INTERRUPTS();
+    OLED_Clear();
+    OLED_ShowString(1, 1, "STACK OVERFLOW!");
+    OLED_ShowString(2, 1, pcTaskName ? pcTaskName : "???");
+    OLED_ShowString(3, 1, "System Halted");
+    for (;;) { }
+}
+
+/* ==================== malloc failed hook ==================== */
+
+void vApplicationMallocFailedHook(void)
+{
+    taskDISABLE_INTERRUPTS();
+    OLED_Clear();
+    OLED_ShowString(1, 1, "MALLOC FAILED!");
+    for (;;) { }
+}
+
+/* ==================== Main ==================== */
+
 int main(void)
 {
     int8_t ret;
 
+    /* Hardware init */
     Delay_InitTick();
     Delay_ms(200);
 
@@ -128,14 +336,14 @@ int main(void)
     CAN_User_Init();
     OLED_ShowString(2, 1, "   CAN OK");
 
-    /* --- W5500 初始化 --- */
+    /* W5500 init */
     ret = W5500_Init();
     if (ret != W5500_OK) {
         OLED_ShowString(3, 1, "   W5500 FAIL!");
         char diag[17];
         sprintf(diag, "   Ver:0x%02X", g_w5500_version);
         OLED_ShowString(4, 1, diag);
-        while (1);  /* 芯片异常 → 停在这里 */
+        while (1);
     }
 
     ret = W5500_ConfigNetwork();
@@ -143,41 +351,27 @@ int main(void)
         OLED_ShowString(3, 1, "   NET CFG ERR");
     } else {
         OLED_ShowString(3, 1, "   ETH OK");
-        OLED_ShowString(4, 1, "Server OK");
-        W5500_TCPServer_Start(MODBUS_PORT);
+        OLED_ShowString(4, 1, "FreeRTOS...");
     }
 
-    Delay_ms(1500);
     ModbusTCP_Init();
+    g_eth_was_connected = 0;
+
+    /* Create FreeRTOS tasks (see README priority table) */
+    xTaskCreate(Task_CAN_Rx,      "CAN_Rx",   STACK_CAN_RX,    NULL, 5, &hTask_CAN_Rx);
+    xTaskCreate(Task_CAN_Monitor, "CAN_Mon",  STACK_CAN_MONITOR, NULL, 4, &hTask_CAN_Monitor);
+    xTaskCreate(Task_CAN_Tx,      "CAN_Tx",   STACK_CAN_TX,    NULL, 3, &hTask_CAN_Tx);
+    xTaskCreate(Task_Protocol,    "Protocol", STACK_PROTOCOL,  NULL, 2, &hTask_Protocol);
+    xTaskCreate(Task_W5500,       "W5500",    STACK_W5500,     NULL, 1, &hTask_W5500);
+    xTaskCreate(Task_Housekeep,   "HouseKp",  STACK_HOUSEKEEP, NULL, 0, &hTask_Housekeep);
+
     OLED_Clear();
+    OLED_ShowString(1, 1, "M: Starting...");
+    OLED_ShowString(2, 1, "FreeRTOS v10.4");
 
-    g_last_oled_tick    = Delay_GetTick();
-    g_last_hbcheck_tick = Delay_GetTick();
-    g_last_sync_tick    = Delay_GetTick();
+    /* Start the scheduler — never returns */
+    vTaskStartScheduler();
 
-    while (1)
-    {
-        uint32_t now = Delay_GetTick();
-
-        if (now - g_last_hbcheck_tick >= HB_CHECK_MS) {
-            CAN_HeartBeatCheck();
-            CAN_ErrorMonitor();
-            CAN_CalcBusLoad();
-            g_last_hbcheck_tick = now;
-        }
-
-        W5500_TCPServer_Run();
-
-        if (now - g_last_sync_tick >= SYNC_MODBUS_MS) {
-            ModbusTCP_SyncFromCAN();
-            g_last_sync_tick = now;
-        }
-
-        ModbusTCP_Process();
-
-        if (now - g_last_oled_tick >= OLED_UPDATE_MS) {
-            OLED_UpdateDisplay();
-            g_last_oled_tick = now;
-        }
-    }
+    /* Should never reach here */
+    while (1) { }
 }

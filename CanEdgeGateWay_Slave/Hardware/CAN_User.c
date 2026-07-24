@@ -1,12 +1,26 @@
+/**
+ * CAN User Layer — Slave Phase 2
+ *
+ * ISR → semaphore → task pipeline.
+ * Added BH1750 light sensor frame support + local cache integration.
+ */
+
 #include "CAN_User.h"
 #include "delay.h"
 #include <string.h>
 
-volatile uint8_t g_can_tx_done = 0;
-volatile uint8_t g_can_rx_flag = 0;
-static CanRxMsg  g_rx_msg;
+/* ---- Globals ---- */
+volatile uint8_t   g_can_rx_flag = 0;
+SemaphoreHandle_t  g_can_rx_sem = NULL;
+LocalCache         g_local_cache;
+volatile uint32_t  g_can_tx_success_count = 0;
+volatile uint32_t  g_can_tx_fail_count = 0;
 
-/* CAN GPIO: PA11=RX浮空, PA12=TX复用推挽 */
+/* ISR-to-task frame buffer */
+static CanRxMsg      g_isr_rx_msg;
+
+/* ==================== GPIO + NVIC ==================== */
+
 static void CAN_GPIO_Init(void)
 {
     GPIO_InitTypeDef gpio;
@@ -26,13 +40,14 @@ static void CAN_NVIC_Init(void)
 {
     NVIC_InitTypeDef nvic;
     nvic.NVIC_IRQChannel                   = USB_LP_CAN1_RX0_IRQn;
-    nvic.NVIC_IRQChannelPreemptionPriority = 1;
+    nvic.NVIC_IRQChannelPreemptionPriority = 0;
     nvic.NVIC_IRQChannelSubPriority        = 0;
     nvic.NVIC_IRQChannelCmd                = ENABLE;
     NVIC_Init(&nvic);
 }
 
-/* CAN初始化: 500kbps, 正常模式, 全通过滤器 */
+/* ==================== Init ==================== */
+
 void CAN_User_Init(void)
 {
     CAN_InitTypeDef       can;
@@ -51,7 +66,7 @@ void CAN_User_Init(void)
     can.CAN_SJW        = CAN_SJW_1tq;
     can.CAN_BS1        = CAN_BS1_5tq;
     can.CAN_BS2        = CAN_BS2_6tq;
-    can.CAN_Prescaler  = 5;    // 500kbps @ 36MHz APB1 (BRP=5, 36/6/12=500k)
+    can.CAN_Prescaler  = 5;    /* 500kbps @ 36MHz APB1 */
     CAN_Init(CAN1, &can);
 
     filter.CAN_FilterNumber           = 0;
@@ -65,12 +80,18 @@ void CAN_User_Init(void)
     filter.CAN_FilterActivation       = ENABLE;
     CAN_FilterInit(&filter);
 
-    CAN_ITConfig(CAN1, CAN_IT_FMP0, ENABLE);  // FIFO0接收中断
-    CAN_ITConfig(CAN1, CAN_IT_TME,  ENABLE);  // 发送邮箱空中断
+    CAN_ITConfig(CAN1, CAN_IT_FMP0, ENABLE);
     CAN_NVIC_Init();
+
+    /* Create semaphore */
+    g_can_rx_sem = xSemaphoreCreateBinary();
+
+    /* Init local cache */
+    LocalCache_Init(&g_local_cache);
 }
 
-/* 发送CAN标准帧, 2ms超时 */
+/* ==================== Send Frame ==================== */
+
 uint8_t CAN_SendFrame(uint32_t id, uint8_t *data, uint8_t len)
 {
     CanTxMsg tx_msg;
@@ -89,8 +110,19 @@ uint8_t CAN_SendFrame(uint32_t id, uint8_t *data, uint8_t len)
     mailbox = CAN_Transmit(CAN1, &tx_msg);
     while (CAN_TransmitStatus(CAN1, mailbox) != CAN_TxStatus_Ok && timeout--)
         Delay_us(1);
-    return (timeout == 0) ? 1 : 0;
+
+    if (timeout == 0) {
+        g_can_tx_fail_count++;
+        LocalCache_OnTxFail(&g_local_cache);
+        return 1;
+    }
+
+    g_can_tx_success_count++;
+    LocalCache_OnTxSuccess(&g_local_cache);
+    return 0;
 }
+
+/* ==================== Checksum ==================== */
 
 static uint8_t CalcChecksum(uint8_t *data, uint8_t len)
 {
@@ -99,13 +131,15 @@ static uint8_t CalcChecksum(uint8_t *data, uint8_t len)
     return chk;
 }
 
-/* 封装CAN帧: 协议头+载荷+校验和, 固定8字节 */
+/* ==================== Frame builders ==================== */
+
 static void SendCANData(uint32_t id, uint8_t func,
                         uint8_t *payload, uint8_t payload_len)
 {
     uint8_t data[8], i;
 
-    data[CAN_DATA_TYPE_IDX] = (id >> 8) & 0x0F;
+    data[CAN_DATA_TYPE_IDX] = (id >= CAN_ID_EMERGENCY_BASE && id < CAN_ID_NORMAL_BASE) ? 0 :
+                               (id >= CAN_ID_LOWFREQ_BASE) ? 2 : 1;
     data[CAN_DATA_SRC_IDX]  = SLAVE_NODE_ID;
     data[CAN_DATA_FUNC_IDX] = func;
 
@@ -115,7 +149,17 @@ static void SendCANData(uint32_t id, uint8_t func,
         data[CAN_DATA_PAYLOAD_IDX + i] = 0;
 
     data[CAN_DATA_CHKSUM_IDX] = CalcChecksum(data, 7);
-    CAN_SendFrame(id, data, 8);
+
+    /* If CAN offline, cache locally instead of sending */
+    if (g_local_cache.can_offline) {
+        LocalCache_Push(&g_local_cache, id, data);
+        return;
+    }
+
+    if (CAN_SendFrame(id, data, 8) != 0) {
+        /* TX failed — cache for replay */
+        LocalCache_Push(&g_local_cache, id, data);
+    }
 }
 
 void CAN_SendHeartBeat(void)
@@ -131,35 +175,41 @@ void CAN_SendTempHumi(uint8_t temp_int, uint8_t temp_dec,
     SendCANData(CAN_ID_NORMAL_BASE, CAN_FUNC_TEMP_HUMI, payload, 4);
 }
 
-/* KEY1: 发送0级紧急报警帧 */
+void CAN_SendLight(uint16_t lux)
+{
+    uint8_t payload[4];
+    payload[0] = (uint8_t)(lux >> 8);
+    payload[1] = (uint8_t)(lux & 0xFF);
+    payload[2] = 0;
+    payload[3] = 0;
+    SendCANData(CAN_ID_LOWFREQ_BASE + SLAVE_NODE_ID, CAN_FUNC_LIGHT, payload, 4);
+}
+
 void CAN_SendAlarm(void)
 {
     uint8_t payload[4] = {SLAVE_NODE_ID, 0x01, 0x00, 0x00};
     SendCANData(CAN_ID_EMERGENCY_BASE, CAN_FUNC_ALARM, payload, 4);
 }
 
-/* KEY2: 发送故障恢复帧 */
 void CAN_SendRecover(void)
 {
     uint8_t payload[4] = {SLAVE_NODE_ID, 0x00, 0x00, 0x00};
     SendCANData(CAN_ID_NORMAL_BASE, CAN_FUNC_RECOVER, payload, 4);
 }
 
-/* CAN FIFO0接收中断 */
-void USB_LP_CAN1_RX0_IRQHandler(void)
+/* ==================== ISR (fast — just read + signal) ==================== */
+
+void CAN1_RX0_IRQHandler(void)
 {
-    if (CAN_GetITStatus(CAN1, CAN_IT_FMP0) != RESET) {
-        CAN_Receive(CAN1, CAN_FIFO0, &g_rx_msg);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    while (CAN_GetITStatus(CAN1, CAN_IT_FMP0) != RESET) {
+        CAN_Receive(CAN1, CAN_FIFO0, &g_isr_rx_msg);
         g_can_rx_flag = 1;
         CAN_ClearITPendingBit(CAN1, CAN_IT_FMP0);
-    }
-}
 
-/* CAN发送完成中断 */
-void USB_HP_CAN1_TX_IRQHandler(void)
-{
-    if (CAN_GetITStatus(CAN1, CAN_IT_TME) != RESET) {
-        g_can_tx_done = 1;
-        CAN_ClearITPendingBit(CAN1, CAN_IT_TME);
+        xSemaphoreGiveFromISR(g_can_rx_sem, &xHigherPriorityTaskWoken);
     }
+
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
