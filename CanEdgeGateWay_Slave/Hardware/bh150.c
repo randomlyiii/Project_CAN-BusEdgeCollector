@@ -6,7 +6,7 @@
  * the GPIO mode (already set by OLED_I2C_Init).
  */
 
-#include "bh1750.h"
+#include "bh150.h"
 #include "delay.h"
 
 /* GPIO helpers — same pins as OLED */

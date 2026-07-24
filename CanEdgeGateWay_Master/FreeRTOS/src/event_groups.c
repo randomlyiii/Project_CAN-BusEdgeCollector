@@ -37,12 +37,7 @@
 /* The following bit fields convey control information in a task's event list
  * item value.  It is important they do not clash with the task notification
  * state. */
-#if configUSE_16_BIT_TICKS == 1
-    #define eventEVENT_BITS_CONTROL_BYTES    ( ( uint8_t ) 0x00U )
-#else
-    #define eventEVENT_BITS_CONTROL_BYTES    ( ( uint8_t ) 0x00U )
-#endif
-
+/* eventEVENT_BITS_CONTROL_BYTES is defined in event_groups.h */
 typedef struct EventGroupDef_t
 {
     EventBits_t     uxEventBits;

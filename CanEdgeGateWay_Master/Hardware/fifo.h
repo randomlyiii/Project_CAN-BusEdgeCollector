@@ -17,8 +17,8 @@
 
 #include "stm32f10x.h"
 #include <stdint.h>
-#include "FreeRTOS.h"
-#include "semphr.h"
+#include "../FreeRTOS/inc/FreeRTOS.h"
+#include "../FreeRTOS/inc/semphr.h"
 
 #define FIFO_HIGH_DEPTH         16
 #define FIFO_NORMAL_DEPTH       64

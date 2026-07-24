@@ -336,7 +336,7 @@
               <MiscControls></MiscControls>
               <Define>USE_STDPERIPH_DRIVER</Define>
               <Undefine></Undefine>
-              <IncludePath>.\Hardware;.\Library;.\Start;.\System;.\User</IncludePath>
+              <IncludePath>.\Hardware;.\Library;.\Start;.\System;.\User;.\FreeRTOS\inc;.\FreeRTOS\src</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -469,6 +469,26 @@
               <FileName>KEY.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Hardware\KEY.h</FilePath>
+            </File>
+            <File>
+              <FileName>lm393.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\lm393.c</FilePath>
+            </File>
+            <File>
+              <FileName>lm393.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\lm393.h</FilePath>
+            </File>
+            <File>
+              <FileName>local_cache.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\local_cache.c</FilePath>
+            </File>
+            <File>
+              <FileName>local_cache.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\local_cache.h</FilePath>
             </File>
           </Files>
         </Group>
@@ -729,6 +749,46 @@
               <FileName>stm32f10x_wwdg.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Library\stm32f10x_wwdg.h</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>freertos/src</GroupName>
+          <Files>
+            <File>
+              <FileName>event_groups.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\FreeRTOS\src\event_groups.c</FilePath>
+            </File>
+            <File>
+              <FileName>heap_4.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\FreeRTOS\src\heap_4.c</FilePath>
+            </File>
+            <File>
+              <FileName>list.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\FreeRTOS\src\list.c</FilePath>
+            </File>
+            <File>
+              <FileName>port.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\FreeRTOS\src\port.c</FilePath>
+            </File>
+            <File>
+              <FileName>queue.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\FreeRTOS\src\queue.c</FilePath>
+            </File>
+            <File>
+              <FileName>tasks.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\FreeRTOS\src\tasks.c</FilePath>
+            </File>
+            <File>
+              <FileName>timers.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\FreeRTOS\src\timers.c</FilePath>
             </File>
           </Files>
         </Group>

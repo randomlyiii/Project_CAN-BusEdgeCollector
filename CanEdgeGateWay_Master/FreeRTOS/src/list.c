@@ -49,7 +49,7 @@ void vListInitialise( List_t * const pxList )
 void vListInitialiseItem( ListItem_t * const pxItem )
 {
     /* Make sure the list item is not recorded as being on a list. */
-    pxItem->pxContainer = NULL;
+    pxItem->pvContainer = NULL;
 }
 /*-----------------------------------------------------------*/
 
@@ -70,7 +70,7 @@ void vListInsertEnd( List_t * const pxList, ListItem_t * const pxNewListItem )
     pxIndex->pxPrevious = pxNewListItem;
 
     /* Remember which list the item is in. */
-    pxNewListItem->pxContainer = pxList;
+    pxNewListItem->pvContainer = pxList;
 
     ( pxList->uxNumberOfItems )++;
 }
@@ -139,7 +139,7 @@ void vListInsert( List_t * const pxList, ListItem_t * const pxNewListItem )
 
     /* Remember which list the item is in.  This allows fast removal of the
      * item later. */
-    pxNewListItem->pxContainer = pxList;
+    pxNewListItem->pvContainer = pxList;
 
     ( pxList->uxNumberOfItems )++;
 }
@@ -149,7 +149,7 @@ UBaseType_t uxListRemove( ListItem_t * const pxItemToRemove )
 {
     /* The list item knows which list it is in.  Obtain the list from the list
      * item. */
-    List_t * const pxList = pxItemToRemove->pxContainer;
+    List_t * const pxList = pxItemToRemove->pvContainer;
 
     pxItemToRemove->pxNext->pxPrevious = pxItemToRemove->pxPrevious;
     pxItemToRemove->pxPrevious->pxNext = pxItemToRemove->pxNext;
@@ -165,7 +165,7 @@ UBaseType_t uxListRemove( ListItem_t * const pxItemToRemove )
 
     /* Reset the list item's container pointer so it is not left pointing to
      * a deleted list. */
-    pxItemToRemove->pxContainer = NULL;
+    pxItemToRemove->pvContainer = NULL;
     ( pxList->uxNumberOfItems )--;
 
     return pxList->uxNumberOfItems;
