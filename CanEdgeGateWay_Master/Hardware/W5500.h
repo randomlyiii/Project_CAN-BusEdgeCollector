@@ -103,6 +103,10 @@ void     W5500_TCPServer_Run(void);
 uint8_t  W5500_IsConnected(void);
 uint8_t  W5500_LinkUp(void);
 
+/* 缓存版 — 不触 SPI，由 W5500_TCPServer_Run() 在内部更新 g_phy_linked。
+ * 供其他任务（如 Housekeep OLED）读取，避免 SPI 总线竞争。 */
+uint8_t  W5500_IsLinkUpCached(void);
+
 int8_t   W5500_SendData(uint8_t *buf, uint16_t len);
 
 /* 底层 SPI — bsb 控制块选择, off 块内偏移 */

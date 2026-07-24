@@ -259,6 +259,9 @@ int8_t W5500_SetNetParam(uint8_t *mac, uint8_t *ip, uint8_t *sub, uint8_t *gw)
 
 uint8_t W5500_LinkUp(void) { return (R_Common(REG_PHYCFGR) & 0x01) ? 1 : 0; }
 
+/* 缓存版 — 由 W5500_TCPServer_Run 每 5ms 更新 g_phy_linked，不触 SPI */
+uint8_t W5500_IsLinkUpCached(void) { return g_phy_linked; }
+
 /* ===================== Socket ===================== */
 static int8_t SocketCmd(uint8_t sock, uint8_t cmd, uint8_t expect_sr)
 {
