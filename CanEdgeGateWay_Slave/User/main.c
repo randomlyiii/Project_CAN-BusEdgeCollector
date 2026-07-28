@@ -2,7 +2,7 @@
  * CAN Edge Gateway Slave — Phase 2 (FreeRTOS)
  *
  * 4-task architecture:
- *   vTask_Sensor (prio 3):   DHT11 + LM393 2s each, cache data
+ *   vTask_Sensor (prio 3):   DHT11 + BH1750 2s each, cache data
  *   vTask_CAN_Slave (prio 2): heartbeat 500ms, TX frames, replay cache
  *   vTask_Key (prio 1):      20ms key scan
  *   vTask_Housekeep (prio 0): 1s watchdog, cache cleanup, OLED
@@ -15,7 +15,7 @@
 #include "dht11.h"
 #include "CAN_User.h"
 #include "KEY.h"
-#include "lm393.h"
+#include "bh150.h"
 #include "local_cache.h"
 #include "stm32f10x_iwdg.h"
 #include <stdio.h>
@@ -37,18 +37,20 @@ static TaskHandle_t hTask_Housekeep  = NULL;
 #define STACK_SENSOR    384
 #define STACK_CAN_SLV   320
 #define STACK_KEY       192
-#define STACK_HOUSEKEEP 192
+#define STACK_HOUSEKEEP 384
 
 /* ---- Sensor data cache ---- */
 static uint8_t  g_temp_int  = 0, g_temp_dec  = 0;
 static uint8_t  g_humi_int  = 0, g_humi_dec  = 0;
 static uint8_t  g_dht11_ok  = 0;
 static uint8_t  g_dht11_fail_cnt = 0;
+static uint8_t  g_dht11_was_in_alarm = 0;   /* 1=已发ALARM，恢复后需发RECOVER */
 static uint16_t g_light_lux = 0;
-static uint8_t  g_lm393_ok = 0;
+static uint8_t  g_bh1750_ok = 0;
 
 /* ---- CAN TX count ---- */
 static uint32_t g_can_tx_oled_count = 0;
+static uint8_t  g_dht11_recover_pending = 0;  /* DHT11 恢复后发 RECOVER */
 
 /* ---- OLED ---- */
 static char g_oled_line[4][17];
@@ -59,16 +61,23 @@ static void OLED_UpdateDisplay(void)
     sprintf(g_oled_line[0], "S:Node#%02u %s",
             SLAVE_NODE_ID, g_dht11_ok ? "Ready" : "FAIL");
 
-    /* Line 2: Temperature + Light (ADC 0-4095 → 0-100%) */
-    if (g_dht11_ok && g_lm393_ok) {
-        uint16_t light_pct = (uint16_t)((uint32_t)g_light_lux * 100 / 4095);
-        sprintf(g_oled_line[1], "T:%u.%uC L:%3u%%",
-                g_temp_int, g_temp_dec, (unsigned int)light_pct);
+    /* Line 2: Temperature + Light (BH1750, auto-range: lux / k-lux) */
+    if (g_dht11_ok && g_bh1750_ok) {
+        uint16_t lux = g_light_lux;
+        if (lux < 1000) {
+            sprintf(g_oled_line[1], "T:%u.%uC L:%3u",
+                    g_temp_int, g_temp_dec, (unsigned int)lux);
+        } else {
+            uint16_t k = lux / 1000;
+            uint8_t  d = (lux % 1000) / 100;   /* 1 decimal */
+            sprintf(g_oled_line[1], "T:%u.%uC L:%u.%uk",
+                    g_temp_int, g_temp_dec, k, d);
+        }
     } else if (g_dht11_ok) {
-        sprintf(g_oled_line[1], "T:%u.%uC L:---%%",
+        sprintf(g_oled_line[1], "T:%u.%uC L:---",
                 g_temp_int, g_temp_dec);
     } else {
-        sprintf(g_oled_line[1], "T:--.-C L:---%%");
+        sprintf(g_oled_line[1], "T:--.-C L:---");
     }
 
     /* Line 3: Humidity + CAN status */
@@ -90,6 +99,9 @@ static void OLED_UpdateDisplay(void)
     }
 
     for (uint8_t i = 0; i < 4; i++) {
+        /* Pad to 16 chars to clear stale pixels on OLED */
+        for (uint8_t j = strlen(g_oled_line[i]); j < 16; j++)
+            g_oled_line[i][j] = ' ';
         g_oled_line[i][16] = '\0';
         OLED_ShowString(i + 1, 1, g_oled_line[i]);
     }
@@ -102,7 +114,7 @@ static void Task_Sensor(void *pvParameters)
     TickType_t xLastWakeTime = xTaskGetTickCount();
     (void)pvParameters;
 
-    /* Update DHT11 every wake, LM393 every other wake (both ~2s) */
+    /* Update DHT11 every wake, BH1750 every other wake (both ~2s) */
     uint8_t cycle = 0;
 
     for (;;) {
@@ -112,13 +124,17 @@ static void Task_Sensor(void *pvParameters)
         if (!g_dht11_ok) {
             g_dht11_fail_cnt++;
         } else {
+            /* 从失败恢复 → 标记发 RECOVER */
+            if (g_dht11_was_in_alarm) {
+                g_dht11_was_in_alarm     = 0;
+                g_dht11_recover_pending  = 1;
+            }
             g_dht11_fail_cnt = 0;
         }
 
-        /* LM393 (every 2 cycles = ~4s during throttle, but 2s base) */
+        /* BH1750 (every 2 cycles = ~4s) */
         if (cycle == 0) {
-            g_light_lux = Lm393_ReadAnalog();
-            g_lm393_ok = 1;
+            g_bh1750_ok = (BH1750_Read(&g_light_lux) == 0);
         }
         cycle = (cycle + 1) & 1;
 
@@ -145,7 +161,7 @@ static void Task_CAN_Slave(void *pvParameters)
         {
             static uint8_t light_div = 0;
             light_div++;
-            if (light_div >= 4 && g_lm393_ok) {
+            if (light_div >= 4 && g_bh1750_ok) {
                 CAN_SendLight(g_light_lux);
                 light_div = 0;
                 g_can_tx_oled_count++;
@@ -162,9 +178,19 @@ static void Task_CAN_Slave(void *pvParameters)
 
         /* Trigger escalation if DHT11 failed 3 consecutive times */
         if (g_dht11_fail_cnt >= 3) {
-            CAN_SendAlarm();
+            if (!g_dht11_was_in_alarm) {
+                CAN_SendAlarm();
+                g_can_tx_oled_count++;
+                g_dht11_was_in_alarm = 1;
+            }
+            g_dht11_fail_cnt = 0;  /* Reset counter, keep alarm state */
+        }
+
+        /* DHT11 recovered → send RECOVER */
+        if (g_dht11_recover_pending) {
+            CAN_SendRecover();
             g_can_tx_oled_count++;
-            g_dht11_fail_cnt = 0;  /* Reset after alarm */
+            g_dht11_recover_pending = 0;
         }
 
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
@@ -199,10 +225,10 @@ static void Task_Housekeep(void *pvParameters)
     TickType_t xLastWakeTime = xTaskGetTickCount();
     (void)pvParameters;
 
-    /* Init IWDG: ~1s timeout */
+    /* Init IWDG: ~4s timeout (LSI=30~60kHz, 留余量防误复位) */
     IWDG_WriteAccessCmd(IWDG_WriteAccess_Enable);
-    IWDG_SetPrescaler(IWDG_Prescaler_64);
-    IWDG_SetReload(625);
+    IWDG_SetPrescaler(IWDG_Prescaler_128);
+    IWDG_SetReload(1250);
     IWDG_ReloadCounter();
     IWDG_Enable();
 
@@ -270,8 +296,8 @@ int main(void)
     DHT11_GPIO_Init();
     OLED_ShowString(2, 1, "   DHT11 OK");
 
-    Lm393_Init();
-    OLED_ShowString(2, 1, "DHT+LM393 OK");
+    BH1750_Init();
+    OLED_ShowString(2, 1, "DHT+BH1750 OK");
 
     CAN_User_Init();
     OLED_ShowString(3, 1, "   CAN OK");
