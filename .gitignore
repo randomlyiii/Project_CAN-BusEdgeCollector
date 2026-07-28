@@ -57,10 +57,10 @@ Desktop.ini
 *.swo
 
 # 其他排除上传
-阶段一.md
-阶段二.md
 图片
 硬件厂家资料
+log
 
 # 本地私有配置文件 (含 IP/MAC 等敏感信息)
 **/config.h
+demo-phase2/
