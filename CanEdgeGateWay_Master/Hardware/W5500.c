@@ -3,6 +3,9 @@
  *
  * 引脚: RST=PC15, SCS=PA4, SCK=PA5, MISO=PA6(AF_PP), MOSI=PA7
  * SPI:  Mode0, 36MHz, FDM1读/VDM写, BSB仅在控制字节
+ *
+ * NOTE: SPI 与 CAN 不可并发。由上层统一任务顺序调度,
+ *       确保 SPI 操作期间 CAN 帧已处理完毕, 反之亦然。
  */
 #include "W5500.h"
 #include "delay.h"
@@ -193,6 +196,7 @@ static void W5500_SPI_Init(void)
     spi.SPI_Mode = SPI_Mode_Master; spi.SPI_DataSize = SPI_DataSize_8b;
     spi.SPI_CPOL = SPI_CPOL_Low; spi.SPI_CPHA = SPI_CPHA_1Edge;
     spi.SPI_NSS = SPI_NSS_Soft; spi.SPI_BaudRatePrescaler = SPI_BaudRatePrescaler_2;
+    /* 36MHz — 降速至 Prescaler_8/16 会导致 W5500 ver:0x00 无法初始化 */
     spi.SPI_FirstBit = SPI_FirstBit_MSB; spi.SPI_CRCPolynomial = 7;
     SPI_Init(SPI1, &spi); SPI_Cmd(SPI1, ENABLE);
 }

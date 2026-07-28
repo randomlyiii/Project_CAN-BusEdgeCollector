@@ -81,6 +81,7 @@ void ModbusTCP_SyncFromCAN(void)
     g_regs[REG_BUSOFF_RECOVERY]    = g_bus_off_recovery_cnt;
     g_regs[REG_HIST_CACHE_COUNT]   = g_cache.hist_count;
     g_regs[REG_THROTTLE_LEVEL]     = g_system_throttle_level;
+    g_regs[REG_LIGHT_SENSOR]       = g_slave_nodes[0].light_lux;
 
     /* Uptime */
     {
