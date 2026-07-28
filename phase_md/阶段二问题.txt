@@ -1,0 +1,115 @@
+阶段二 FreeRTOS 问题总结 — 按难度×常见度排序（2026-07-28 验收版）
+===================================================================
+
+一、🔴 vTaskStartScheduler() 破坏 CAN 外设寄存器
+  根因：vTaskStartScheduler() 内部（SysTick 配置等）会静默改写
+  CAN 外设寄存器。裸机能收帧，FreeRTOS 下完全不收（FMP=0, REC=255）。
+  诊断耗时 3 天，经历了 SPI EMI 怀疑、寄存器实时显示、硬件剔除测试。
+  修复：CAN 初始化必须在调度器启动后的任务中执行（DeInit + Init）。
+  难度：★★★★★ | 常见度：高（FreeRTOS+CAN 项目必遇）
+
+二、🔴 W5500 SPI 与 CAN 多任务并发致总线冲突
+  根因：W5500 SPI（PA5/PA6/PA7）与 CAN RX（PA11/PA12）全部在
+  GPIOA 端口。FreeRTOS 多任务抢占下 SPI 时钟边沿与 CAN 采样窗口
+  物理重叠 → 比特错误。裸机 while(1) 顺序执行正常。
+  修复：回退统一顺序任务（CAN→W5500→CAN 单循环 10ms）。
+  难度：★★★★★ | 常见度：中（多外设共享端口时）
+
+三、🔴 taskENTER_CRITICAL 锁死 SysTick → 任务饿死
+  根因：BASEPRI=0x50 屏蔽优先级 ≥5 的中断，SysTick 优先级 15
+  （0xF0≥0x50）被屏蔽 → Tick 不增长 → vTaskDelayUntil 永不超时
+  → IWDG 复位。临界区内用 DWT 延时更恶劣（Tick 不前进但真实时间流逝）。
+  修复：W5500 独占 SPI 不需临界区。临界区内禁止 DWT 延时/I2C/SPI。
+  难度：★★★★☆ | 常见度：很高（FreeRTOS 新手必踩）
+
+四、🔴 xSemaphoreGiveFromISR 在任务上下文调用
+  根因：CAN_ProcessFrame() 在 Task_CAN_Rx（任务上下文）中调用
+  xSemaphoreGiveFromISR()，该函数操作 xPendingReadyList + 优先级
+  位图，与 SysTick 的 xTaskIncrementTick 同时修改链表 → 指针损坏。
+  无 HardFault，调度器启动后立即挂死。调试版因不走此路径不触发。
+  修复：任务上下文用 xSemaphoreGive，不用 FromISR 版本。
+  难度：★★★★☆ | 常见度：高（FromISR 滥用）
+
+五、🔴 MSP 栈溢出踩 ucHeap[] → 随机崩溃无 HardFault
+  根因：CAN_User_Init + W5500_Init 调用链深度超 512B MSP。
+  溢出向下踩 .bss 段 ucHeap[]（FreeRTOS 堆数组），pvPortMalloc
+  返回损坏内存 → xTaskCreate 的 TCB/栈被破坏 → 任务随机崩溃。
+  不触发 HardFault（踩的不是栈边界）。
+  修复：MSP 512B→1024B。Housekeep 栈 256→384 words。
+  难度：★★★★☆ | 常见度：中（重量级 init 时）
+
+六、ARMCC V5 __asm 宏不展开 → 调度器不启动
+  根因：#define vPortSVCHandler SVC_Handler 在 ARMCC V5 的 __asm
+  函数中不展开。向量表指向 startup.s 的 WEAK 空循环（B .），
+  首条 SVC 指令即卡死。从站一直卡 "S: Starting..."。
+  修复：直接命名 __asm void SVC_Handler(void)，不用宏映射。
+  难度：★★★☆☆ | 常见度：中（ARMCC 移植）
+
+七、CAN 外设配置多处错误（优先级/波特率/IPU/AWUM）
+  (a) CAN ISR 优先级 0/1 → 穿透 BASEPRI 临界区，调 FromISR 破坏内核
+  (b) 波特率 Prescaler=5 实际 600kbps → 修正 Prescaler=6 真 500kbps
+  (c) PA11 IN_FLOATING → 空闲电平不确定 → 改为 IPU 内部上拉
+  (d) AWUM/ABOM 均 ENABLE → 改为 DISABLE，匹配厂家参考配置
+  (e) SJW=1 仅 138ns → SJW=2 给 330ns 同步窗口
+  修复：全部对照厂家参考代码逐一修正。
+  难度：★★★☆☆ | 常见度：很高（CAN 配置极易出错）
+
+八、configUSE_TIMERS=1 无定时器时 timer 任务空转
+  根因：configUSE_TIMERS=1 时自动创建 timer 守护任务（prio 7）。
+  无 xTimerCreate 时该任务不阻塞（xQueueReceive 空队列立即返回），
+  全速空循环占用 100% CPU，饿死所有用户任务。
+  修复：不创建软件定时器时设 configUSE_TIMERS=0。
+  难度：★★☆☆☆ | 常见度：中（config 开关陷阱）
+
+九、tasks.c 缺栈填充/水位检测补丁 → Method 2 误报
+  根因：从站恢复主站代码时遗漏三段补丁：
+  (a) memset 栈填充 → 栈内容全 0 → *pxStack=0≠0xa5a5a5a5 恒真误报
+  (b) uxStackDepth 未赋值 → uxTaskGetStackHighWaterMark 始终返回 0
+  (c) 水位比较用字节常量 0xa5 而非字常量 0xa5a5a5a5 → 永远不匹配
+  修复：补三段代码使 Method 2 可靠。
+  难度：★★★☆☆ | 常见度：中（裁剪内核时）
+
+十、IWDG LSI 频率漂移 → 喂狗前复位
+  根因：LSI 标称 40kHz 但范围 30~60kHz。Prescaler=64, Reload=625
+  时 @60kHz 超时仅 667ms，Housekeep 1s 喂狗来不及。
+  修复：Prescaler=128, Reload=1250，@60kHz 超时 2.67s 有余量。
+  难度：★★☆☆☆ | 常见度：很高（所有 STM32 IWDG 用户）
+
+十一、多任务抢占 SPI 总线 → 数据竞争
+  根因：Task_W5500（prio 1）和 Task_Housekeep（prio 0）通过不同
+  路径共享 SPI1。Housekeep 调 OLED → ETH_StateStr → W5500_LinkUp
+  触发 SPI 读，与 W5500 主循环的 SPI 操作交叉破坏寄存器。
+  修复：添加 W5500_IsLinkUpCached() 缓存 PHY 状态，其他任务读缓存。
+  难度：★★★☆☆ | 常见度：高（多任务共享外设时）
+
+十二、调度器启动前 ISR 已置位信号量
+  根因：CAN ISR 在 main() 初始化后在 vTaskStartScheduler() 之前
+  触发，Give 将信号量置位。调度器启动后等待该信号量的任务立即就绪，
+  在 Idle 任务上下文未完全建立时运行。
+  修复：vTaskStartScheduler() 前 Drain 所有信号量（Take with 0 timeout）。
+  难度：★★☆☆☆ | 常见度：中（时序竞态）
+
+十三、CAN ISR 使能顺序错误 → xSemaphoreGiveFromISR(NULL)
+  根因：CAN_ITConfig 使能中断在 xSemaphoreCreateBinary 之前。若
+  初始化后立即触发 ISR，信号量为 NULL → configASSERT → 死循环。
+  修复：先创建所有信号量/互斥量，最后使能中断。
+  难度：★★☆☆☆ | 常见度：中（初始化顺序）
+
+十四、FreeRTOS 内核裁剪 → 61 个编译/链接错误
+  (a) TCB_t 守卫宏逻辑错误 → 完整结构体被跳过（30 errors）
+  (b) QueueDefinition 缺 ucQueueTypeInternal 字段（5 errors）
+  (c) port.c 汇编 IMPORT 缺失（3 errors）
+  (d) SysTick_Handler 宏映射与 Delay.c 重名冲突（1 error）
+  (e) TCB_t 缺非标准字段 uxStackDepth（1 error）
+  (f) RAM 20KB 预算超限 2.6KB（20 errors）
+  (g) xTaskGetCurrentTaskHandle 只声明未实现（1 error）
+  修复：修正 6 类内核文件，RAM 压缩（Heap 15→12KB, libc heap=0）。
+  难度：★★☆☆☆ | 常见度：很高（首次移植 FreeRTOS 必遇）
+
+十五、sprintf 格式化串溢出踩相邻内存
+  根因：sprintf(buf17, "R%-4s %u %u %-3s", ...) 最坏 17 字符
+  + null = 18 字节超出 17 字节缓冲区。溢出字节踩到相邻行缓存
+  → OLED 显示残留字符。
+  修复：缩为 "R%-4s %s %u/%u"（最坏 14 字符）。所有 sprintf
+  均需手动计算最大输出长度。
+  难度：★☆☆☆☆ | 常见度：很高（嵌入式 sprintf 必犯）
