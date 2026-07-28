@@ -29,7 +29,7 @@
 /*------------------------ 基础时钟与调度配置 -------------------------------*/
 
 #define configCPU_CLOCK_HZ                      (72000000UL)
-#define configTICK_RATE_HZ                      (1000)              /* 1ms per tick */
+#define configTICK_RATE_HZ                      (100)               /* 10ms per tick, 降频减EMI */
 #define configUSE_PREEMPTION                    1                   /* 抢占式调度     */
 #define configUSE_TIME_SLICING                  1                   /* 同优先级轮转   */
 #define configIDLE_SHOULD_YIELD                 1                   /* Idle 主动让出  */

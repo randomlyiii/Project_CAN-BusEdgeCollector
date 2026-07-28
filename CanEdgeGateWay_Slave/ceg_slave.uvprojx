@@ -471,16 +471,6 @@
               <FilePath>.\Hardware\KEY.h</FilePath>
             </File>
             <File>
-              <FileName>lm393.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Hardware\lm393.c</FilePath>
-            </File>
-            <File>
-              <FileName>lm393.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\Hardware\lm393.h</FilePath>
-            </File>
-            <File>
               <FileName>local_cache.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Hardware\local_cache.c</FilePath>
@@ -489,6 +479,16 @@
               <FileName>local_cache.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Hardware\local_cache.h</FilePath>
+            </File>
+            <File>
+              <FileName>bh150.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\bh150.c</FilePath>
+            </File>
+            <File>
+              <FileName>bh150.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\bh150.h</FilePath>
             </File>
           </Files>
         </Group>

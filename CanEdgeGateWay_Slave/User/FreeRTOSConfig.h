@@ -31,7 +31,7 @@
 #define configUSE_COUNTING_SEMAPHORES           1
 #define configUSE_RECURSIVE_MUTEXES             1
 #define configUSE_APPLICATION_TASK_TAG          0
-#define configUSE_TIMERS                        1
+#define configUSE_TIMERS                        0   /* 无软件定时器, 关闭 timer 守护任务 */
 #define configTIMER_TASK_PRIORITY               (configMAX_PRIORITIES - 1)
 #define configTIMER_TASK_STACK_DEPTH            (128)
 #define configTIMER_QUEUE_LENGTH                (10)
@@ -58,11 +58,6 @@
 #define configMAX_PRIORITIES_MASK        ((1UL << (uint32_t)configMAX_PRIORITIES) - 1)
 
 #define configASSERT(x)                  if ((x) == 0) { taskDISABLE_INTERRUPTS(); for(;;); }
-
-/* ISR handler name mapping (macros rename FreeRTOS default names → vector table names) */
-#define vPortSVCHandler        SVC_Handler
-#define xPortPendSVHandler     PendSV_Handler
-/* SysTick: handled by System/Delay.c → calls xPortSysTickHandler() */
 
 #define configASSERT_DEFINED   0   /* skip portASSERT_IF_INTERRUPT_PRIORITY_INVALID checks */
 
