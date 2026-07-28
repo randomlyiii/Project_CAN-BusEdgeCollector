@@ -104,10 +104,11 @@ void SysTick_Handler(void)
 
 /**
  * Get millisecond tick count (FreeRTOS-based)
+ * Returns actual milliseconds regardless of RTOS tick rate.
  */
 uint32_t Delay_GetTick(void)
 {
-    return (uint32_t)xTaskGetTickCount();
+    return (uint32_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
 }
 
 /**
