@@ -113,9 +113,9 @@ void vPortSetupTimerInterrupt( void );
 /*
  * Exception handlers.
  */
-void xPortPendSVHandler( void );
+void PendSV_Handler( void );
 void xPortSysTickHandler( void );
-void vPortSVCHandler( void );
+void SVC_Handler( void );
 
 /*
  * Start first task is a separate function so it can be tested in isolation.
@@ -205,7 +205,7 @@ static void prvTaskExitError( void )
 }
 /*-----------------------------------------------------------*/
 
-__asm void vPortSVCHandler( void )
+__asm void SVC_Handler( void )
 {
 	PRESERVE8
 
@@ -371,7 +371,7 @@ void vPortExitCritical( void )
 }
 /*-----------------------------------------------------------*/
 
-__asm void xPortPendSVHandler( void )
+__asm void PendSV_Handler( void )
 {
 	extern uxCriticalNesting;
 	extern pxCurrentTCB;

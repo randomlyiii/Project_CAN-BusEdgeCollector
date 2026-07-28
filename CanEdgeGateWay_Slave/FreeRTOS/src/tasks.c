@@ -40,6 +40,7 @@
 
 /* Constants. */
 #define tskSTACK_FILL_BYTE    ( 0xa5U )
+#define tskSTACK_FILL_WORD    ( ( StackType_t ) 0xa5a5a5a5UL )
 #define tskIDLE_STACK_SIZE    configMINIMAL_STACK_SIZE
 
 /* Task notification states. */
@@ -405,6 +406,13 @@ static void prvInitialiseNewTask( TaskFunction_t pxTaskCode, const char * const 
         ( void ) memset( ( void * ) &( pxNewTCB->ulNotifiedValue[ 0 ] ), 0x00, sizeof( pxNewTCB->ulNotifiedValue ) );
         ( void ) memset( ( void * ) &( pxNewTCB->ucNotifyState[ 0 ] ), 0x00, sizeof( pxNewTCB->ucNotifyState ) );
     #endif
+
+    /* 记录栈深度 (水位检测用) + 填充栈魔数 (Method 2 检查依赖) */
+    pxNewTCB->uxStackDepth = ulStackDepth;
+    {
+        ( void ) memset( pxNewTCB->pxStack, ( int ) tskSTACK_FILL_BYTE,
+                         ( size_t ) ulStackDepth * sizeof( StackType_t ) );
+    }
 
     #if ( INCLUDE_xTaskAbortDelay == 1 )
         pxNewTCB->ucDelayAborted = pdFALSE;
@@ -1031,7 +1039,7 @@ TickType_t uxTaskResetEventItemValue( void )
         #else
             pcEndOfStack = pxTCB->pxEndOfStack;
         #endif
-        while( ( *pcEndOfStack == ( StackType_t ) tskSTACK_FILL_BYTE ) && ( uxReturn < ( UBaseType_t ) pxTCB->uxStackDepth ) )
+        while( ( *pcEndOfStack == tskSTACK_FILL_WORD ) && ( uxReturn < ( UBaseType_t ) pxTCB->uxStackDepth ) )
         { pcEndOfStack++; uxReturn++; }
         return uxReturn;
     }
