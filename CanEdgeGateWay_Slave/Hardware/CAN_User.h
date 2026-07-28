@@ -3,7 +3,7 @@
  *
  * Changes from Phase 1:
  *   - ISR simplified: read frame + signal semaphore
- *   - Added LM393 light sensor frame (CAN_FUNC_LIGHT, ID 0x300+node)
+ *   - Added BH1750 light sensor frame (CAN_FUNC_LIGHT, ID 0x300+node)
  *   - Local cache for CAN-offline fault tolerance
  */
 

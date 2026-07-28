@@ -2,7 +2,7 @@
  * CAN User Layer — Slave Phase 2
  *
  * ISR → semaphore → task pipeline.
- * Added LM393 light sensor frame support + local cache integration.
+ * Added BH1750 light sensor frame support + local cache integration.
  */
 
 #include "CAN_User.h"
@@ -27,7 +27,7 @@ static void CAN_GPIO_Init(void)
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
 
     gpio.GPIO_Pin   = GPIO_Pin_11;
-    gpio.GPIO_Mode  = GPIO_Mode_IN_FLOATING;
+    gpio.GPIO_Mode  = GPIO_Mode_IPU;          /* 匹配厂家参考: 内部上拉防浮空噪声 */
     GPIO_Init(GPIOA, &gpio);
 
     gpio.GPIO_Pin   = GPIO_Pin_12;
@@ -39,8 +39,10 @@ static void CAN_GPIO_Init(void)
 static void CAN_NVIC_Init(void)
 {
     NVIC_InitTypeDef nvic;
+    /* CAN RX0 — priority 5 (≥ configMAX_SYSCALL_INTERRUPT_PRIORITY).
+     * Must be ≥5 to safely call xSemaphoreGiveFromISR / portYIELD_FROM_ISR. */
     nvic.NVIC_IRQChannel                   = USB_LP_CAN1_RX0_IRQn;
-    nvic.NVIC_IRQChannelPreemptionPriority = 0;
+    nvic.NVIC_IRQChannelPreemptionPriority = 5;
     nvic.NVIC_IRQChannelSubPriority        = 0;
     nvic.NVIC_IRQChannelCmd                = ENABLE;
     NVIC_Init(&nvic);
@@ -57,16 +59,17 @@ void CAN_User_Init(void)
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_CAN1, ENABLE);
 
     can.CAN_TTCM       = DISABLE;
-    can.CAN_ABOM       = ENABLE;
-    can.CAN_AWUM       = ENABLE;
+    can.CAN_ABOM       = DISABLE; /* 匹配厂家参考: 关自动 Bus-Off 恢复 */
+    can.CAN_AWUM       = DISABLE; /* 匹配厂家参考: 关自动唤醒 */
     can.CAN_NART       = DISABLE;
     can.CAN_RFLM       = DISABLE;
     can.CAN_TXFP       = DISABLE;
     can.CAN_Mode       = CAN_Mode_Normal;
-    can.CAN_SJW        = CAN_SJW_1tq;
+    /* 500kbps: 36MHz/(6×12tq)=500kbps, SJW=2tq 容忍晶振偏差 ~1500ppm */
+    can.CAN_SJW        = CAN_SJW_2tq;
     can.CAN_BS1        = CAN_BS1_5tq;
     can.CAN_BS2        = CAN_BS2_6tq;
-    can.CAN_Prescaler  = 5;    /* 500kbps @ 36MHz APB1 */
+    can.CAN_Prescaler  = 6;
     CAN_Init(CAN1, &can);
 
     filter.CAN_FilterNumber           = 0;
@@ -109,18 +112,22 @@ uint8_t CAN_SendFrame(uint32_t id, uint8_t *data, uint8_t len)
 
     timeout = 2000;
     mailbox = CAN_Transmit(CAN1, &tx_msg);
-    while (CAN_TransmitStatus(CAN1, mailbox) != CAN_TxStatus_Ok && timeout--)
+    while (timeout--) {
+        if (CAN_TransmitStatus(CAN1, mailbox) == CAN_TxStatus_Ok)
+            goto send_ok;
         Delay_us(1);
-
-    if (timeout == 0) {
-        g_can_tx_fail_count++;
-        LocalCache_OnTxFail(&g_local_cache);
-        return 1;
     }
+    goto tx_fail;
 
+send_ok:
     g_can_tx_success_count++;
     LocalCache_OnTxSuccess(&g_local_cache);
     return 0;
+
+tx_fail:
+    g_can_tx_fail_count++;
+    LocalCache_OnTxFail(&g_local_cache);
+    return 1;
 }
 
 /* ==================== Checksum ==================== */
@@ -151,11 +158,6 @@ static void SendCANData(uint32_t id, uint8_t func,
 
     data[CAN_DATA_CHKSUM_IDX] = CalcChecksum(data, 7);
 
-    /* If CAN offline, cache locally instead of sending */
-    if (g_local_cache.can_offline) {
-        LocalCache_Push(&g_local_cache, id, data);
-        return;
-    }
 
     if (CAN_SendFrame(id, data, 8) != 0) {
         /* TX failed — cache for replay */

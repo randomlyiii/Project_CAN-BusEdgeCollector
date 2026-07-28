@@ -32,6 +32,7 @@ static volatile BaseType_t g_rx_higher_prio_woken = pdFALSE;
 /* ---- Load calculation ---- */
 static uint32_t g_tx_bit_count   = 0;
 static uint32_t g_rx_bit_count   = 0;
+static uint32_t g_last_bus_activity = 0;  /* 最近帧收发时间(ms) */
 static uint32_t g_window_start   = 0;
 static uint32_t g_throttle_stable_cnt = 0;  /* hysteresis counter */
 #define LOAD_WINDOW_MS          100
@@ -57,7 +58,7 @@ static void CAN_GPIO_Init(void)
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
 
     gpio.GPIO_Pin   = GPIO_Pin_11;
-    gpio.GPIO_Mode  = GPIO_Mode_IN_FLOATING;
+    gpio.GPIO_Mode  = GPIO_Mode_IPU;          /* 匹配厂家参考: 内部上拉防浮空噪声 */
     GPIO_Init(GPIOA, &gpio);
 
     gpio.GPIO_Pin   = GPIO_Pin_12;
@@ -70,16 +71,18 @@ static void CAN_NVIC_Init(void)
 {
     NVIC_InitTypeDef nvic;
 
-    /* CAN RX0 interrupt — highest HW priority */
+    /* CAN RX0 interrupt — priority 5 (≥ configMAX_SYSCALL_INTERRUPT_PRIORITY).
+     * Must be ≥5 to safely call xSemaphoreGiveFromISR / portYIELD_FROM_ISR.
+     * Priorities 0-4 are NOT masked by FreeRTOS BASEPRI critical sections. */
     nvic.NVIC_IRQChannel                   = USB_LP_CAN1_RX0_IRQn;
-    nvic.NVIC_IRQChannelPreemptionPriority = 0;
+    nvic.NVIC_IRQChannelPreemptionPriority = 5;
     nvic.NVIC_IRQChannelSubPriority        = 0;
     nvic.NVIC_IRQChannelCmd                = ENABLE;
     NVIC_Init(&nvic);
 
-    /* CAN SCE (error) interrupt */
+    /* CAN SCE (error) interrupt — priority 6 */
     nvic.NVIC_IRQChannel                   = CAN1_SCE_IRQn;
-    nvic.NVIC_IRQChannelPreemptionPriority = 1;
+    nvic.NVIC_IRQChannelPreemptionPriority = 6;
     nvic.NVIC_IRQChannelSubPriority        = 0;
     nvic.NVIC_IRQChannelCmd                = ENABLE;
     NVIC_Init(&nvic);
@@ -107,19 +110,20 @@ void CAN_User_Init(void)
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_CAN1, ENABLE);
 
     can.CAN_TTCM       = DISABLE;
-    can.CAN_ABOM       = ENABLE;  /* Auto Bus-Off recovery after 128×11 recessive bits */
-    can.CAN_AWUM       = ENABLE;
+    can.CAN_ABOM       = DISABLE; /* 匹配厂家参考: 关自动 Bus-Off 恢复 */
+    can.CAN_AWUM       = DISABLE; /* 匹配厂家参考: 关自动唤醒 */
     can.CAN_NART       = DISABLE;
     can.CAN_RFLM       = DISABLE;
     can.CAN_TXFP       = DISABLE;
     can.CAN_Mode       = CAN_Mode_Normal;
-    can.CAN_SJW        = CAN_SJW_1tq;
+    /* 500kbps: 36MHz/(6×12tq)=500kbps, SJW=2tq 容忍晶振偏差 ~1500ppm */
+    can.CAN_SJW        = CAN_SJW_2tq;
     can.CAN_BS1        = CAN_BS1_5tq;
     can.CAN_BS2        = CAN_BS2_6tq;
-    can.CAN_Prescaler  = 5;    /* 500kbps @ 36MHz APB1 */
+    can.CAN_Prescaler  = 6;
     CAN_Init(CAN1, &can);
 
-    /* Accept ALL frames */
+    /* Accept ALL standard frames */
     filter.CAN_FilterNumber           = 0;
     filter.CAN_FilterMode             = CAN_FilterMode_IdMask;
     filter.CAN_FilterScale            = CAN_FilterScale_32bit;
@@ -141,11 +145,9 @@ void CAN_User_Init(void)
     /* FIFO init (creates mutexes — must also be done before interrupts) */
     FIFO_Init();
 
-    /* THEN enable CAN interrupts (ISRs will find valid semaphore handles) */
-    CAN_ITConfig(CAN1, CAN_IT_FMP0, ENABLE);
-    CAN_ITConfig(CAN1, CAN_IT_ERR, ENABLE);
-    CAN_ITConfig(CAN1, CAN_IT_BOF, ENABLE);
-    CAN_NVIC_Init();
+    /* CAN 中断延后到调度器启动前一刻再使能 (main.c 中调用 CAN_EnableInterrupts())
+     * 防止初始化阶段 OLED I2C 被优先级 0 的 CAN ISR 打断 */
+    /* (移到了 CAN_EnableInterrupts() 中) */
 
     /* Init slave node records */
     for (i = 0; i < MAX_SLAVE_NODES; i++) {
@@ -154,6 +156,19 @@ void CAN_User_Init(void)
     }
 
     g_window_start = Delay_GetTick();
+    g_last_bus_activity = Delay_GetTick();
+}
+
+/* ==================== CAN Enable Interrupts (delayed) ==================== */
+
+void CAN_EnableInterrupts(void)
+{
+    /* 延迟使能 CAN 中断 — 到调度器启动前一刻才开,
+       避免初始化阶段(OLED 显示等)被优先级 0 的 CAN ISR 打断 I2C 时序 */
+    CAN_ITConfig(CAN1, CAN_IT_FMP0, ENABLE);
+    CAN_ITConfig(CAN1, CAN_IT_ERR, ENABLE);
+    CAN_ITConfig(CAN1, CAN_IT_BOF, ENABLE);
+    CAN_NVIC_Init();
 }
 
 /* ==================== CAN Reset (enhanced Bus-Off recovery) ==================== */
@@ -163,6 +178,14 @@ void CAN_ResetBus(void)
     CAN_DeInit(CAN1);
     Delay_ms(10);
     CAN_User_Init();
+
+    /* FIXME: CAN_User_Init() recreates semaphores → tasks blocked on old handles
+     * will never wake from new ISR signals. Proper fix: separate HW init from
+     * RTOS object creation. For now, BusOff recovery restores CAN TX (emergency
+     * frame below) but RX path is broken until system restart. */
+
+    /* Re-enable CAN interrupts — CAN_User_Init() leaves them off */
+    CAN_EnableInterrupts();
 
     g_bus_off_recovery_cnt++;
 
@@ -192,10 +215,16 @@ uint8_t CAN_SendFrame(uint32_t id, uint8_t *data, uint8_t len)
 
     timeout = 1000;
     mailbox = CAN_Transmit(CAN1, &tx_msg);
-    while (CAN_TransmitStatus(CAN1, mailbox) != CAN_TxStatus_Ok && timeout--)
+    while (timeout--) {
+        if (CAN_TransmitStatus(CAN1, mailbox) == CAN_TxStatus_Ok)
+            goto send_ok;
         Delay_us(1);
-    if (timeout == 0) return 1;
+    }
+    return 1;
+
+send_ok:
     g_tx_bit_count += CAN_FRAME_BITS;
+    g_last_bus_activity = Delay_GetTick();
     return 0;
 }
 
@@ -275,6 +304,7 @@ void CAN_ProcessFrame(CanRxFrame *p)
 
     g_can_rx_int_count++;
     g_rx_bit_count += CAN_FRAME_BITS;
+    g_last_bus_activity = Delay_GetTick();
 
     /* Find or register slave node */
     found = 0;
@@ -340,6 +370,15 @@ void CAN_ProcessFrame(CanRxFrame *p)
         g_slave_nodes[i].blacklist = 0;
         g_slave_nodes[i].online = 1;
         g_slave_nodes[i].last_heartbeat_tick = now;
+        break;
+
+    case CAN_FUNC_LIGHT:
+        g_slave_nodes[i].light_lux =
+            ((uint16_t)p->Data[CAN_DATA_PAYLOAD_IDX] << 8)
+            | p->Data[CAN_DATA_PAYLOAD_IDX + 1];
+        /* keep node online */
+        g_slave_nodes[i].last_heartbeat_tick = now;
+        g_slave_nodes[i].online = 1;
         break;
     }
 
@@ -420,6 +459,8 @@ void CAN_CalcBusLoad(void)
     uint32_t max_bps       = 500000UL;   /* 500kbps */
     uint32_t load           = (uint32_t)((uint64_t)bits_per_sec * 10000 / max_bps);
     if (load > 10000) load = 10000;
+    /* 1s 内有过活动 → 最小 0.01% */
+    if (load == 0 && g_last_bus_activity > 0 && now - g_last_bus_activity < 1000) load = 1;
     g_can_error.bus_load = (uint16_t)load;
 
     /* ---- Throttle decision with hysteresis ---- */

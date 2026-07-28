@@ -57,6 +57,7 @@ typedef struct {
     uint8_t  temp_dec;
     uint8_t  humi_int;
     uint8_t  humi_dec;
+    uint16_t light_lux;         /* BH1750 lux (CAN_FUNC_LIGHT) */
 } SlaveNode_t;
 
 /* ---- CAN error status ---- */
@@ -92,6 +93,7 @@ extern SemaphoreHandle_t  g_can_monitor_sem;
 
 /* ---- CAN init ---- */
 void CAN_User_Init(void);
+void CAN_EnableInterrupts(void);
 void CAN_ResetBus(void);
 
 /* ---- Frame send ---- */
