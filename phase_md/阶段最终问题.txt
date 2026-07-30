@@ -1,0 +1,10 @@
+1. vTaskStartScheduler 破坏 CAN 寄存器 — main()中初始化 CAN → 调度器启动后寄存器被静默篡改 → 从站 CAN 通信异常。修复: CAN 初始化移至 Task 上下文。
+2. CAN RX 中断洪泛 → 调度器崩溃 — 从站使能 FMP0 中断后每秒数十次 ISR → xSemaphoreGiveFromISR + portYIELD 高频触发 PendSV → Housekeep 饿死 → IWDG 复位。修复: 从站改纯轮询，零中断。
+3. RX FIFO 无限循环 → IWDG 饿死 — while(CAN_MessagePending > 0) 在活跃总线永不退出。修复: 加 drain ≤16 帧/周期上限。
+4. 多从站同时上电 CAN 冲突 — 两个从站同时发帧 → 仲裁冲突 → TEC 累积 → BusOff。修复: 按 node_id 错峰 2s 启动。
+5. I2C 共享总线无互斥 — BH1750 与 OLED 共用 PB8/PB9 软件 I2C → 不同优先级任务同时操作 GPIO → 数据竞争 → 花屏/数据错乱。修复: 加 FreeRTOS 互斥锁（优先级继承）。
+6. ADC 校准/转换无限等待 — while 轮询 ADC 状态位无超时 → 电气噪声导致状态位不变 → 死等。修复: 所有外设等待循环加超时兜底。
+7. 主站 OLED sprintf 溢出 16 字符 — g_oled_line[17] 无边界检查 → 大数值格式化踩相邻行缓冲区。修复: 加 OLED_CompactNum 压缩显示 + 数值 clamp。
+8. SPI 死循环（W5500）— while(TXE==RESET) 无超时 → CAN ALARM 帧电磁干扰 SPI 走线 → TXE 永远不置位。修复: 加 200 轮超时 + g_chip_ok 标记。
+9. 单节点假离线 — 2 节点时终端阻抗 60Ω 信号差 → CRC 错 → BusOff → HeartBeatCheck 收不到帧判 slave 掉线；CAN_ResetBus 用 DeInit+Init 暴力复位违反 CAN 协议；g_boff_consec 10ms 周期重复累加过早拉长冷却。修复: HeartBeatCheck 加 error_level≥2 跳过；INRQ 协议恢复；边沿检测。
+10. 从站 ALARM 发不出 — tx_budget=2 被心跳+传感器数据吃光 → alarm_active 帧永远没有发送机会。修复: ALARM/RECOVER 移出预算控制，不计 tx_budget 无条件发送。
