@@ -170,8 +170,9 @@ filter.CAN_FilterFIFOAssignment   = CAN_FIFO0;
 ```c
 CAN_ProcessFrame:
   1. DLC 校验 (!=8 则丢弃)
-  2. g_can_rx_int_count++
-  3. 查找/注册从站节点
+  2. Checksum 校验 (XOR byte0~6 != byte7 则丢弃)
+  3. g_can_rx_int_count++
+  4. 查找/注册从站节点
   4. 收到任何帧 → online=1, stale=0, offline=0, expire_start_tick=0
      → timestamp=now, g_boff_consec=0（清零连续 BusOff 计数）
   5. 按 func 分支:
@@ -195,14 +196,12 @@ CAN_ProcessFrame:
 | CalcBusLoad | 100ms 窗口滑动计算 → 负载 >70% 限速 / >90% 紧急模式 |
 | CAN_SendFrame | 1ms 超时轮询 → 失败返回 1 |
 
-#### HeartBeatCheck（三态标记, 无惩罚, BusOff 保护）
+#### HeartBeatCheck（三态标记, 每节点独立判定）
 
 ```c
 void CAN_HeartBeatCheck(void) {
-    /* BusOff(3)/Passive(2) 时 master 控制器收不到任何帧,
-     * 但不代表 slave 掉线. 跳过检测防止假离线. */
-    if (g_can_error.error_level >= 2) return;
-
+    /* 每节点独立判定. 去掉 error_level 门禁 — 避免总线错误波及全部节点.
+     * 仅通过 checksum 校验的合法帧才能刷新节点时间戳. */
     for (uint8_t i = 0; i < MAX_SLAVE_NODES; i++) {
         if (g_slave_nodes[i].node_id == 0) continue;
         if (!g_slave_nodes[i].online) continue;
@@ -223,7 +222,7 @@ void CAN_HeartBeatCheck(void) {
 }
 ```
 
-> **状态变迁**: 收到帧→全部清除 | >3s→EXP | >30s→OFF | ALARM 帧→ALM | BusOff/Passive→跳过
+> **状态变迁**: 收到合法帧(checksum通过)→全部清除 | >3s→EXP | >30s→OFF | ALARM 帧→ALM | 节点独立判定
 
 #### ErrorMonitor（ABOM=DISABLE, INRQ 协议恢复）
 
@@ -422,6 +421,9 @@ static uint8_t SPI_SendByte(uint8_t dat) {
 | 8 | hb_lost/blacklist 复杂耦合 | 超时/黑名单/防抖多重状态联动 | 精简为 stale/offline 两段标记 + CAN_ProcessFrame 统一置位 |
 | 9 | CAN_ResetBus 暴力软件复位 | `CAN_DeInit + Init` 违反 CAN 协议, 时序寄存器全丢 | 改 INRQ 进入/退出初始化模式, 硬件走 128 隐性位恢复 |
 | 10 | g_boff_consec 10ms 周期重复累加 | ErrorMonitor 10ms 轮询, 一次 BusOff 等冷却期间被加到 20+ | 边沿检测 boff_counted, 仅 error_level 跳变时累加一次 |
+| 11 | CAN_ProcessFrame 缺少 checksum 校验 | 干扰帧 DLC=8 但 data 被损坏 → 污染节点时间戳 | 加 XOR 异或校验, byte7不一致直接丢弃 |
+| 12 | HeartBeatCheck error_level 门禁牵连全节点 | S2断线后 error_level≥2 → 整函数跳过 → S1也判离线 | 去掉 error_level≥2 gate, 每节点独立判定 |
+| 13 | 告警帧无收发限流 | 从站连续上报 ALARM → FIFO堆积 → 正常帧处理延迟 | 从站 1→2s 降频, 主站 200ms/节点限频, 丢弃计数 |
 
 ---
 

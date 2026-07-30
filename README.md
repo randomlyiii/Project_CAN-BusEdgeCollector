@@ -72,7 +72,9 @@
 
 ```
 Task_Unified:
-  1. CAN Rx:  FIFO0 轮询（全通滤波器，FMP0 中断禁用）
+  1. CAN Rx:  FIFO0 轮询
+     → DLC 校验 (≠8 丢弃) → Checksum 异或校验
+     → CAN_ProcessFrame (节点匹配 → 时间戳刷新)
   2. CAN 监控: ErrorMonitor → HeartBeatCheck → CalcBusLoad
   3. W5500:   TCP Server Run → Modbus Process → SyncFromCAN
   4. 按键翻页 + IWDG 喂狗
@@ -94,13 +96,15 @@ Task_Housekeep (prio 0, 1s): OLED 刷新 + 栈水位监控
 
 ### 心跳检测
 
-两段标记，收到任何帧自动清除。BusOff 时跳过检测（防假离线）：
+两段标记，每节点独立判定。仅通过 checksum 校验的合法帧才能刷新时间戳。
 
 ```
-收到帧 ─→ ON       (delta ≤ 3s)
-3s 无帧 ─→ EXP     (stale，短期过期)
+收到合法帧 ─→ ON       (delta ≤ 3s)
+3s 无合法帧 ─→ EXP     (stale，短期过期)
 30s EXP ─→ OFF     (offline，确认离线)
 ```
+
+**节点隔离**：单节点断线不影响其他节点在线状态。无全局 error_level 门禁。
 
 ---
 
@@ -131,12 +135,15 @@ Task_Housekeep (prio 0, 1s): OLED 刷新 + 栈水位监控
 2. **所有 while 循环必须加超时** — 外设状态位可能因电气噪声永远不变
 3. **I2C 共享总线必须互斥** — 不同优先级的两个任务操作同一软件 I2C = 数据竞争
 4. **CAN 初始化必须在调度器启动后** — `vTaskStartScheduler()` 破坏 CAN 寄存器
-5. **BusOff 时跳过心跳检测** — 主站收不到帧是硬件问题，不是从站掉线
+5. **心跳检测无 error_level 门禁** — 单节点断线的总线错误不牵连其他节点。每节点 stale/offline 独立判定
 6. **CAN BusOff 恢复用 INRQ 协议** — `DeInit+Init` 暴力复位违反 CAN 协议，可能引发总线风暴
 7. **OLED sprintf 必须 ≤16 字符** — `g_oled_line[17]` 无溢出检查，超长踩内存
 8. **SPI 与 CAN 不可并发** — GPIOA 端口共用，SPI 时钟耦合至 CAN RX 引脚
 9. **ALARM 帧不计 tx_budget** — 紧急帧必须无条件发出，不受数据流限速约束
 10. **NART=ENABLE（从站）** — 硬件自动重传在总线故障时推 TEC 至 BusOff，单帧丢失影响远小于全网震荡
+11. **checksum 校验必须与 DLC 校验配合** — DLC 保证长度合规，checksum 保证数据完整。缺任一都可能被干扰帧污染节点时间戳
+12. **告警帧收发均限流** — 从站发送 1 次/秒（连续告警降 2s），主站接收 200ms/节点。防止单从站故障引起的总线告警风暴
+13. **中断或轮询，二选一** — 不可混合使用。ISR 和 Task 同时读同一硬件 FIFO 必然产生竞态，导致帧丢失
 
 ---
 
