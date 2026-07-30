@@ -17,6 +17,7 @@ volatile uint8_t   g_can_rx_flag = 0;
 LocalCache         g_local_cache;
 volatile uint32_t  g_can_tx_success_count = 0;
 volatile uint32_t  g_can_tx_fail_count = 0;
+volatile uint16_t  g_alarm_drop_cnt = 0;          /* 告警限流丢弃计数 */
 
 /* ==================== GPIO Init (PA11=RX, PA12=TX) ==================== */
 
@@ -180,6 +181,21 @@ void CAN_SendLight(uint16_t lux)
 
 void CAN_SendAlarm(void)
 {
+    static uint32_t last_tick = 0;
+    static uint8_t  consec = 0;
+    uint32_t now = Delay_GetTick();
+    uint32_t interval;
+
+    if (now - last_tick > 5000) consec = 0;
+    interval = (consec >= 5) ? 2000 : 1000;
+
+    if (now - last_tick < interval) {
+        if (g_alarm_drop_cnt < 65535) g_alarm_drop_cnt++;
+        return;
+    }
+    last_tick = now;
+    if (consec < 250) consec++;
+
     uint8_t payload[4] = {slave_node_id, 0x01, 0x00, 0x00};
     SendCANData(CAN_ID_EMERGENCY_BASE, CAN_FUNC_ALARM, payload, 4);
 }

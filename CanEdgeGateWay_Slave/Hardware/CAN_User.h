@@ -48,6 +48,7 @@ extern volatile uint8_t   g_can_rx_flag;
 extern LocalCache         g_local_cache;
 extern volatile uint32_t  g_can_tx_success_count;
 extern volatile uint32_t  g_can_tx_fail_count;
+extern volatile uint16_t  g_alarm_drop_cnt;       /* 告警丢弃计数(限流溢出) */
 
 /* ---- Init ---- */
 void CAN_User_Init(void);

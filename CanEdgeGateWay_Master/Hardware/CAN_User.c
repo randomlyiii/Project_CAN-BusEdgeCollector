@@ -397,11 +397,14 @@ void CAN_ProcessFrame(CanRxFrame *p)
     uint32_t now    = Delay_GetTick();
     uint8_t  i, found;
 
-    /* DLC 校验: 协议约定 8 字节 */
-    if (p->DLC != 8) {
-        static uint32_t dlc_err = 0;
-        if (++dlc_err < 10);  /* 忽略, 仅占位 */
-        return;
+    /* DLC 校验: 协议约定 8 字节, 非法长度直接丢弃 */
+    if (p->DLC != 8) return;
+
+    /* Checksum 校验: byte7 = XOR(byte0~6), 防总线干扰帧污染节点状态 */
+    {
+        uint8_t chk = 0;
+        for (uint8_t ci = 0; ci < 7; ci++) chk ^= p->Data[ci];
+        if (chk != p->Data[CAN_DATA_CHKSUM_IDX]) return;
     }
 
     g_can_rx_int_count++;
@@ -453,10 +456,15 @@ void CAN_ProcessFrame(CanRxFrame *p)
         g_slave_nodes[i].humi_dec = p->Data[CAN_DATA_PAYLOAD_IDX + 3];
         break;
 
-    case CAN_FUNC_ALARM:
+    case CAN_FUNC_ALARM: {
+        static uint32_t last_alarm[MAX_SLAVE_NODES] = {0};
+        uint32_t now_a = Delay_GetTick();
+        if (now_a - last_alarm[src_id] < 200) break;
+        last_alarm[src_id] = now_a;
         g_slave_nodes[i].fault_flag = 1;
         CAN_User_OnAlarm(src_id, func);
         break;
+    }
 
     case CAN_FUNC_RECOVER:
         g_slave_nodes[i].fault_flag = 0;
@@ -498,11 +506,8 @@ void CAN_HeartBeatCheck(void)
     uint32_t now;
     uint8_t i;
 
-    /* BusOff(3) 时 master 控制器收不到任何帧, 但不代表 slave 掉线.
-     * Error Passive(2) 时接收可能也不稳定. 跳过检测防止假离线. */
-    if (g_can_error.error_level >= 2)
-        return;
-
+    /* 每节点独立刷新(checksum已验证), 单节点断线不牵连其他节点.
+     * 去掉 error_level 门禁 — 避免 error_passive 周期全节点假离线. */
     now = Delay_GetTick();
 
     for (i = 0; i < MAX_SLAVE_NODES; i++) {
