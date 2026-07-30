@@ -1,22 +1,29 @@
 /**
- * CAN Edge Gateway Slave — Phase 2 (FreeRTOS)
+ * CAN Edge Gateway Slave — Final Phase (Config-Driven Multi-Variant)
  *
- * 4-task architecture:
- *   vTask_Sensor (prio 3):   DHT11 + BH1750 2s each, cache data
- *   vTask_CAN_Slave (prio 2): heartbeat 500ms, TX frames, replay cache
- *   vTask_Key (prio 1):      20ms key scan
- *   vTask_Housekeep (prio 0): 1s watchdog, cache cleanup, OLED
+ * Architecture:
+ *   Config layer  (Config/slave_config.h)    — one-line variant switch
+ *   Sensor layer  (Hardware/sensor_manager)   — table-driven, conditional compile
+ *   CAN layer     (Hardware/CAN_User)         — generic CAN_SendSensorData()
+ *   OLED layer    (inline renderers)          — table-driven, sensor-count adaptive
+ *
+ * 4-task FreeRTOS:
+ *   vTask_Sensor   (prio 3, 200ms): sensor_manager_read_all()
+ *   vTask_CAN_Slave(prio 2, 500ms): heartbeat + sensor data + alarm/recover + cache replay
+ *   vTask_Key      (prio 1,  20ms): key scan -> alarm/recover
+ *   vTask_Housekeep(prio 0,   1s): IWDG, stack watermarks, OLED update
  */
 
 #include "stm32f10x.h"
-#include "FreeRTOSConfig.h"
+#include "../FreeRTOS/inc/FreeRTOS.h"
+#include "../FreeRTOS/inc/task.h"
+#include "../Config/slave_config.h"
 #include "delay.h"
 #include "oled.h"
-#include "dht11.h"
 #include "CAN_User.h"
 #include "KEY.h"
-#include "bh150.h"
 #include "local_cache.h"
+#include "sensor_manager.h"
 #include "stm32f10x_iwdg.h"
 #include <stdio.h>
 #include <string.h>
@@ -33,171 +40,256 @@ static TaskHandle_t hTask_CAN_Slave  = NULL;
 static TaskHandle_t hTask_Key        = NULL;
 static TaskHandle_t hTask_Housekeep  = NULL;
 
-/* ---- Task stacks ---- */
+/* ---- Task stacks (Phase-2-verified values) ---- */
 #define STACK_SENSOR    384
 #define STACK_CAN_SLV   320
 #define STACK_KEY       192
 #define STACK_HOUSEKEEP 384
 
-/* ---- Sensor data cache ---- */
-static uint8_t  g_temp_int  = 0, g_temp_dec  = 0;
-static uint8_t  g_humi_int  = 0, g_humi_dec  = 0;
-static uint8_t  g_dht11_ok  = 0;
-static uint8_t  g_dht11_fail_cnt = 0;
-static uint8_t  g_dht11_was_in_alarm = 0;   /* 1=已发ALARM，恢复后需发RECOVER */
-static uint16_t g_light_lux = 0;
-static uint8_t  g_bh1750_ok = 0;
-
-/* ---- CAN TX count ---- */
+/* ---- CAN TX count (shared: CAN task increments, Housekeep reads for OLED) ---- */
 static uint32_t g_can_tx_oled_count = 0;
-static uint8_t  g_dht11_recover_pending = 0;  /* DHT11 恢复后发 RECOVER */
 
-/* ---- OLED ---- */
+/* ---- OLED line buffer (16 chars + null) ---- */
 static char g_oled_line[4][17];
 
-static void OLED_UpdateDisplay(void)
+/* ================================================================
+ * OLED Line Renderers — table-driven, sensor-count adaptive
+ *
+ * Layout:
+ *   Line 1: Node info (always)
+ *   Line 2: Sensor[0] data (if count >= 1)
+ *   Line 3: Sensor[1] data (if count >= 2) or "No Sensor!"
+ *   Line 4: CAN + cache status (always)
+ *
+ * Each renderer writes <=16 chars to buf[17]. The caller pads to 16.
+ * ================================================================ */
+
+/* Line renderer function pointer type */
+typedef void (*line_renderer_t)(char *buf, uint16_t buf_size);
+
+/* ---- Line 1: Node identity + global status ---- */
+static void oled_render_node_info(char *buf, uint16_t size)
 {
-    /* Line 1: Node ID + status */
-    sprintf(g_oled_line[0], "S:Node#%02u %s",
-            SLAVE_NODE_ID, g_dht11_ok ? "Ready" : "FAIL");
+    const char *status = sensor_manager_has_alarm() ? "ALARM" : "Ready";
+    snprintf(buf, size, "S:%s %s", slave_node_name_str, status);
+}
 
-    /* Line 2: Temperature + Light (BH1750, auto-range: lux / k-lux) */
-    if (g_dht11_ok && g_bh1750_ok) {
-        uint16_t lux = g_light_lux;
-        if (lux < 1000) {
-            sprintf(g_oled_line[1], "T:%u.%uC L:%3u",
-                    g_temp_int, g_temp_dec, (unsigned int)lux);
+/* ---- Line 2/3: Per-sensor data (dispatched by type_id) ---- */
+static void oled_render_sensor_data(char *buf, uint16_t size, uint8_t idx)
+{
+    sensor_t *s = sensor_manager_get_by_index(idx);
+    if (!s) {
+        snprintf(buf, size, "?              ");
+        return;
+    }
+    if (!s->online) {
+        snprintf(buf, size, "%s:OFFLINE", s->name);
+        return;
+    }
+
+    switch (s->type_id) {
+    case SENSOR_TYPE_DHT11:
+        /* Max: "T:50.9C H:90.9%" = 15 chars, safe within 16 */
+        snprintf(buf, size, "T:%u.%uC H:%u.%u%%",
+                 (unsigned int)s->last_data.dht11.temp_int,
+                 (unsigned int)s->last_data.dht11.temp_dec,
+                 (unsigned int)s->last_data.dht11.humi_int,
+                 (unsigned int)s->last_data.dht11.humi_dec);
+        break;
+
+    case SENSOR_TYPE_BH1750: {
+        uint16_t lux = s->last_data.bh1750.lux;
+        if (lux < 1000UL) {
+            snprintf(buf, size, "Lux:%-4u      ", (unsigned int)lux);
         } else {
-            uint16_t k = lux / 1000;
-            uint8_t  d = (lux % 1000) / 100;   /* 1 decimal */
-            sprintf(g_oled_line[1], "T:%u.%uC L:%u.%uk",
-                    g_temp_int, g_temp_dec, k, d);
+            uint16_t k = lux / 1000U;
+            uint8_t  d = (lux % 1000U) / 100U;
+            snprintf(buf, size, "Lux:%u.%uk      ", (unsigned int)k, (unsigned int)d);
         }
-    } else if (g_dht11_ok) {
-        sprintf(g_oled_line[1], "T:%u.%uC L:---",
-                g_temp_int, g_temp_dec);
-    } else {
-        sprintf(g_oled_line[1], "T:--.-C L:---");
+        break;
     }
 
-    /* Line 3: Humidity + CAN status */
-    {
-        const char *can = LocalCache_IsOffline(&g_local_cache) ? "OFF" : "OK ";
-        if (g_dht11_ok)
-            sprintf(g_oled_line[2], "H:%u.%u%% C:%-6s", g_humi_int, g_humi_dec, can);
-        else
-            sprintf(g_oled_line[2], "H:--.-%% C:%-6s", can);
-    }
+    case SENSOR_TYPE_LM393_AO:
+        snprintf(buf, size, "Lm DO:%s A:%-4u",
+                 s->last_data.lm393.digital ? "DK" : "BR",
+                 (unsigned int)s->last_data.lm393.analog);
+        break;
 
-    /* Line 4: TX count + cache usage */
-    {
-        uint8_t cache_count = LocalCache_Count(&g_local_cache);
-        uint32_t tx = g_can_tx_oled_count;
-        if (tx > 99999) tx = 99999;
-        sprintf(g_oled_line[3], "TX:%05lu C:%02u/%-2u",
-                (unsigned long)tx, cache_count, LOCAL_CACHE_MAX);
-    }
+    case SENSOR_TYPE_RESERVED:
+        snprintf(buf, size, "CH1:----       ");
+        break;
 
-    for (uint8_t i = 0; i < 4; i++) {
-        /* Pad to 16 chars to clear stale pixels on OLED */
-        for (uint8_t j = strlen(g_oled_line[i]); j < 16; j++)
-            g_oled_line[i][j] = ' ';
-        g_oled_line[i][16] = '\0';
-        OLED_ShowString(i + 1, 1, g_oled_line[i]);
+    default:
+        snprintf(buf, size, "%-16s", s->name);
+        break;
     }
 }
 
-/* ==================== Task: Sensor (priority 3) ==================== */
+/* ---- Line 4: CAN TX count + cache occupancy ---- */
+static void oled_render_can_status(char *buf, uint16_t size)
+{
+    const char *can_state = LocalCache_IsOffline(&g_local_cache) ? "OFF" : "OK ";
+    uint8_t cache_cnt = LocalCache_Count(&g_local_cache);
+    uint32_t tx = g_can_tx_oled_count;
+    if (tx > 99999) tx = 99999;
+
+    snprintf(buf, size, "TX:%05lu C:%02u/%-2u",
+             (unsigned long)tx, cache_cnt, LOCAL_CACHE_MAX);
+}
+
+/* ---- Master OLED update: assemble 4-line display ---- */
+static void OLED_UpdateDisplay(void)
+{
+    char line_buf[17];
+    uint8_t sensor_count = sensor_manager_get_count();
+    uint8_t line = 0;
+    uint8_t j;
+
+    /* Line 1: Node info (always present) */
+    oled_render_node_info(line_buf, sizeof(line_buf));
+    for (j = strlen(line_buf); j < 16; j++) line_buf[j] = ' ';
+    line_buf[16] = '\0';
+    OLED_ShowString(++line, 1, line_buf);
+
+    /* Line 2-3: Sensor data -- populated by sensor count */
+    if (sensor_count >= 1) {
+        oled_render_sensor_data(line_buf, sizeof(line_buf), 0);
+        for (j = strlen(line_buf); j < 16; j++) line_buf[j] = ' ';
+        line_buf[16] = '\0';
+        OLED_ShowString(++line, 1, line_buf);
+    }
+    if (sensor_count >= 2) {
+        oled_render_sensor_data(line_buf, sizeof(line_buf), 1);
+        for (j = strlen(line_buf); j < 16; j++) line_buf[j] = ' ';
+        line_buf[16] = '\0';
+        OLED_ShowString(++line, 1, line_buf);
+    }
+    if (sensor_count == 0) {
+        snprintf(line_buf, sizeof(line_buf), " No Sensor!    ");
+        line_buf[16] = '\0';
+        OLED_ShowString(++line, 1, line_buf);
+    }
+    /* Pad remaining sensor lines to clear stale pixels */
+    while (line < 3) {
+        snprintf(line_buf, sizeof(line_buf), "                ");
+        line_buf[16] = '\0';
+        OLED_ShowString(++line, 1, line_buf);
+    }
+
+    /* Line 4: CAN + cache status (always at bottom) */
+    oled_render_can_status(line_buf, sizeof(line_buf));
+    for (j = strlen(line_buf); j < 16; j++) line_buf[j] = ' ';
+    line_buf[16] = '\0';
+    OLED_ShowString(4, 1, line_buf);
+}
+
+/* ================================================================
+ * Task: Sensor (priority 3, 200ms scan)
+ *
+ * sensor_manager_read_all() handles all sensors in one call.
+ * Each sensor's actual sample interval is gated internally by
+ * last_read_tick -- the 200ms scan rate just ensures timely polling.
+ * ================================================================ */
 
 static void Task_Sensor(void *pvParameters)
 {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     (void)pvParameters;
 
-    /* Update DHT11 every wake, BH1750 every other wake (both ~2s) */
-    uint8_t cycle = 0;
-
     for (;;) {
-        /* DHT11 */
-        g_dht11_ok = (DHT11_Read_Data(&g_humi_int, &g_humi_dec,
-                                       &g_temp_int, &g_temp_dec) == 0);
-        if (!g_dht11_ok) {
-            g_dht11_fail_cnt++;
-        } else {
-            /* 从失败恢复 → 标记发 RECOVER */
-            if (g_dht11_was_in_alarm) {
-                g_dht11_was_in_alarm     = 0;
-                g_dht11_recover_pending  = 1;
-            }
-            g_dht11_fail_cnt = 0;
-        }
-
-        /* BH1750 (every 2 cycles = ~4s) */
-        if (cycle == 0) {
-            g_bh1750_ok = (BH1750_Read(&g_light_lux) == 0);
-        }
-        cycle = (cycle + 1) & 1;
-
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(2000));
+        sensor_manager_read_all();
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(200));
     }
 }
 
-/* ==================== Task: CAN Slave (priority 2) ==================== */
+/* ================================================================
+ * Task: CAN Slave (priority 2, 500ms)
+ *
+ * Sends heartbeat, iterates sensor table to publish data, handles
+ * alarm/recover escalation, and replays cached frames on CAN recovery.
+ * ================================================================ */
 
 static void Task_CAN_Slave(void *pvParameters)
 {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     uint32_t   id;
     uint8_t    data[CAN_DATA_LEN];
+    uint8_t    i;
     (void)pvParameters;
 
+    /* CAN init MUST be in task context — scheduler running = ISR safe */
+    CAN_DeInit(CAN1);
+    Delay_ms(10);
+    CAN_User_Init();
+
+    /* Startup stagger: each slave waits before first TX.
+       Slave #1 (node_id=0x01) → 0ms, Slave #2 (node_id=0x02) → 2000ms */
+    vTaskDelay(pdMS_TO_TICKS((slave_node_id - 1) * 2000));
+
     for (;;) {
-        /* Heartbeat + temp/humi (every 500ms) */
-        CAN_SendHeartBeat();
-        CAN_SendTempHumi(g_temp_int, g_temp_dec, g_humi_int, g_humi_dec);
-        g_can_tx_oled_count++;
-
-        /* Light sensor (every 2s: 4th wake) */
+        /* Drain RX FIFO (max 16 frames/cycle — prevents IWDG starvation
+           on busy bus). Polling-based, no ISR needed. */
         {
-            static uint8_t light_div = 0;
-            light_div++;
-            if (light_div >= 4 && g_bh1750_ok) {
-                CAN_SendLight(g_light_lux);
-                light_div = 0;
-                g_can_tx_oled_count++;
+            CanRxMsg rx_msg;
+            uint8_t drain = 0;
+            while (CAN_MessagePending(CAN1, CAN_FIFO0) > 0 && drain < 16) {
+                CAN_Receive(CAN1, CAN_FIFO0, &rx_msg);
+                drain++;
+                (void)rx_msg;  /* Slave doesn't process frames, just drains */
             }
         }
 
-        /* Replay cached data if CAN recovered */
-        if (LocalCache_ShouldReplay(&g_local_cache)) {
-            if (LocalCache_Pop(&g_local_cache, &id, data) == 0) {
-                CAN_SendFrame(id, data, 8);
-                g_can_tx_oled_count++;
-            }
-        }
+        /* TX 预算: 每周期最多发 3 帧 */
+        uint8_t tx_budget = 3;
 
-        /* Trigger escalation if DHT11 failed 3 consecutive times */
-        if (g_dht11_fail_cnt >= 3) {
-            if (!g_dht11_was_in_alarm) {
+        /* 1. Heartbeat (always) */
+        if (tx_budget) { CAN_SendHeartBeat(); g_can_tx_oled_count++; tx_budget--; }
+
+        /* 2. 告警/恢复 (emergency, 不计预算 — 掉线传感器也必须能发 ALARM) */
+        for (i = 0; i < sensor_manager_get_count(); i++) {
+            sensor_t *s = sensor_manager_get_by_index(i);
+            if (!s || !s->enabled) continue;
+            if (s->alarm_active) {
                 CAN_SendAlarm();
                 g_can_tx_oled_count++;
-                g_dht11_was_in_alarm = 1;
             }
-            g_dht11_fail_cnt = 0;  /* Reset counter, keep alarm state */
+            if (s->recover_pending) {
+                CAN_SendRecover();
+                g_can_tx_oled_count++;
+                s->recover_pending = 0;
+            }
         }
 
-        /* DHT11 recovered → send RECOVER */
-        if (g_dht11_recover_pending) {
-            CAN_SendRecover();
-            g_can_tx_oled_count++;
-            g_dht11_recover_pending = 0;
+        /* 3. 在线传感器数据 (预算剩余内尽量发) */
+        for (i = 0; i < sensor_manager_get_count() && tx_budget > 0; i++) {
+            sensor_t *s = sensor_manager_get_by_index(i);
+            if (!s || !s->online || !s->enabled) continue;
+            if (!s->read_fn) continue;
+            CAN_SendSensorData(s->type_id, &s->last_data);
+            g_can_tx_oled_count++; tx_budget--;
+        }
+
+        /* 清理过期缓存帧 > 10s, 防恢复后总线流量风暴 */
+        LocalCache_Cleanup(&g_local_cache);
+
+        /* Cache replay: 有预算时补传 */
+        while (tx_budget && LocalCache_ShouldReplay(&g_local_cache)) {
+            if (LocalCache_Pop(&g_local_cache, &id, data) == 0) {
+                CAN_SendFrame(id, data, 8);
+                g_can_tx_oled_count++; tx_budget--;
+            }
         }
 
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
     }
 }
 
-/* ==================== Task: Key (priority 1, 20ms) ==================== */
+/* ================================================================
+ * Task: Key (priority 1, 20ms)
+ *
+ * KEY1 short press -> CAN alarm
+ * KEY2 short press -> CAN recover
+ * ================================================================ */
 
 static void Task_Key(void *pvParameters)
 {
@@ -218,14 +310,18 @@ static void Task_Key(void *pvParameters)
     }
 }
 
-/* ==================== Task: Housekeep (priority 0, 1s) ==================== */
+/* ================================================================
+ * Task: Housekeep (priority 0, 1s)
+ *
+ * IWDG feeding, stack high-water monitoring, OLED refresh.
+ * ================================================================ */
 
 static void Task_Housekeep(void *pvParameters)
 {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     (void)pvParameters;
 
-    /* Init IWDG: ~4s timeout (LSI=30~60kHz, 留余量防误复位) */
+    /* Init IWDG: ~4s timeout (LSI=30~60kHz, margin for false reset) */
     IWDG_WriteAccessCmd(IWDG_WriteAccess_Enable);
     IWDG_SetPrescaler(IWDG_Prescaler_128);
     IWDG_SetReload(1250);
@@ -242,11 +338,13 @@ static void Task_Housekeep(void *pvParameters)
             stacks[1] = uxTaskGetStackHighWaterMark(hTask_CAN_Slave);
             stacks[2] = uxTaskGetStackHighWaterMark(hTask_Key);
             stacks[3] = uxTaskGetStackHighWaterMark(hTask_Housekeep);
-            (void)stacks;  /* TODO: USART1 log if < 20% */
+            (void)stacks;
         }
 
-        /* Update OLED */
+        /* Update OLED — protect I2C bus shared with BH1750 */
+        if (g_i2c_mutex) xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50));
         OLED_UpdateDisplay();
+        if (g_i2c_mutex) xSemaphoreGive(g_i2c_mutex);
 
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
     }
@@ -274,55 +372,69 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
     for (;;) { }
 }
 
-/* ==================== Main ==================== */
+/* ================================================================
+ * Main
+ *
+ * Init flow:
+ *   1. NVIC priority group (4-bit preemption -- mandatory for FreeRTOS BASEPRI)
+ *   2. Delay init + OLED
+ *   3. sensor_manager_init() -- config-driven, inits all enabled sensors
+ *   4. CAN + KEY init
+ *   5. Create FreeRTOS tasks
+ *   6. vTaskStartScheduler()
+ * ================================================================ */
 
 int main(void)
 {
-    /* Hardware init */
-
-    /* CRITICAL: 4-bit preemption priority (no sub-priority).
-       FreeRTOS BASEPRI mechanism requires ALL priority bits to be
-       preemption-priority bits. Default reset value is 0-bit preemption
-       which silently breaks all FreeRTOS critical sections. */
+    /* CRITICAL: 4-bit preemption priority */
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_4);
 
     Delay_InitTick();
     Delay_ms(200);
 
+    /* DIAG: PA1 output -- HIGH = scheduler starting */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    {
+        GPIO_InitTypeDef g;
+        g.GPIO_Pin   = GPIO_Pin_1;
+        g.GPIO_Mode  = GPIO_Mode_Out_PP;
+        g.GPIO_Speed = GPIO_Speed_50MHz;
+        GPIO_Init(GPIOA, &g);
+        GPIO_ResetBits(GPIOA, GPIO_Pin_1);
+    }
+
     OLED_Init();
     OLED_Clear();
-    OLED_ShowString(1, 1, "S: Init...");
+    OLED_ShowString(1, 1, "S: Init...     ");
 
-    DHT11_GPIO_Init();
-    OLED_ShowString(2, 1, "   DHT11 OK");
+    /* Init sensors (conditional compile in sensor_manager -- only inits
+       what slave_has_xxx enables). WARNING: PB11(DHT11) is shorted to
+       I2C bus(PB8/PB9) on some boards -- set slave_has_dht11=0 in config. */
+    sensor_manager_init();
+    OLED_ShowString(2, 1, " Sensors OK    ");
 
-    BH1750_Init();
-    OLED_ShowString(2, 1, "DHT+BH1750 OK");
-
-    CAN_User_Init();
-    OLED_ShowString(3, 1, "   CAN OK");
+    /* CAN init in Task_CAN_Slave — slave is TX-only, no RX interrupt needed */
 
     KEY_Init();
-    OLED_ShowString(4, 1, "   Key OK");
+    OLED_ShowString(4, 1, "   Key OK      ");
 
-    Delay_ms(1000);
+    Delay_ms(500);
     OLED_Clear();
 
-    /* Create FreeRTOS tasks */
     xTaskCreate(Task_Sensor,    "Sensor",  STACK_SENSOR,    NULL, 3, &hTask_Sensor);
     xTaskCreate(Task_CAN_Slave, "CAN_Slv", STACK_CAN_SLV,   NULL, 2, &hTask_CAN_Slave);
     xTaskCreate(Task_Key,       "Key",     STACK_KEY,       NULL, 1, &hTask_Key);
     xTaskCreate(Task_Housekeep, "HouseKp", STACK_HOUSEKEEP, NULL, 0, &hTask_Housekeep);
 
-    OLED_ShowString(1, 1, "S: Starting...");
-    OLED_ShowString(2, 1, "FreeRTOS v10.4");
+    OLED_ShowString(1, 1, "S: Starting... ");
+    OLED_ShowString(2, 1, "FreeRTOS v10.4 ");
+
+    GPIO_SetBits(GPIOA, GPIO_Pin_1);  /* HIGH = scheduler starting */
 
     vTaskStartScheduler();
 
-    /* DIAGNOSTIC: reached only if scheduler failed to start */
+    /* Should never reach here */
     OLED_Clear();
-    OLED_ShowString(1, 1, "SCHED FAILED!");
-    OLED_ShowString(2, 1, "vTaskStartSched");
-    OLED_ShowString(3, 1, "returned!!!");
+    OLED_ShowString(1, 1, "SCHED FAILED!  ");
     while (1) { }
 }
