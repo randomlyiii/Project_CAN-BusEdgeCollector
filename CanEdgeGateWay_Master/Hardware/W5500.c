@@ -39,10 +39,16 @@ static uint8_t  g_phy_linked      = 0;
 #define W5500_CS_HIGH()  GPIO_SetBits(W5500_SCS_PORT, W5500_SCS_PIN)
 
 /* ===================== SPI 底层 ===================== */
-static void SPI_SendByte(uint8_t dat)
+static uint8_t SPI_SendByte(uint8_t dat)
 {
+    uint32_t to = 200;          /* ≈17µs @72MHz */
     SPI_I2S_SendData(W5500_SPI, dat);
-    while (SPI_I2S_GetFlagStatus(W5500_SPI, SPI_I2S_FLAG_TXE) == RESET);
+    while (--to) {
+        if (SPI_I2S_GetFlagStatus(W5500_SPI, SPI_I2S_FLAG_TXE) != RESET)
+            return 0;           /* OK */
+    }
+    g_chip_ok = 0;              /* SPI 异常 — 标记 W5500 离线 */
+    return 1;                   /* 超时 */
 }
 static void SPI_SendShort(uint16_t dat) { SPI_SendByte(dat>>8); SPI_SendByte(dat&0xFF); }
 
@@ -296,12 +302,14 @@ void W5500_TCPServer_Run(void)
 {
     if (!g_chip_ok) return;
     uint8_t sr = R_Sock(0, OFF_SN_SR);
+    if (!g_chip_ok) return;             /* SPI 异常 — 放弃本轮操作 */
     g_socket_status = sr; g_phy_linked = W5500_LinkUp();
 
     switch (sr) {
     case SOCK_ESTABLISHED: {
         g_w5500_online = 1; g_close_wait_tick = g_closed_tick = 0;
         uint16_t rx_sz = R_Sock2(0, OFF_SN_RX_RSR);
+        if (!g_chip_ok) break;          /* SPI 异常 — 停止读取 */
         if (rx_sz > 0) {
             uint16_t rd = R_Sock2(0, OFF_SN_RX_RD);
             uint16_t room = W5500_RX_BUF_SIZE - g_w5500_rx_ring.count;
