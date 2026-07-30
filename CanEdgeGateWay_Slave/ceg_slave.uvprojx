@@ -336,7 +336,7 @@
               <MiscControls></MiscControls>
               <Define>USE_STDPERIPH_DRIVER</Define>
               <Undefine></Undefine>
-              <IncludePath>.\Hardware;.\Library;.\Start;.\System;.\User;.\FreeRTOS\inc;.\FreeRTOS\src</IncludePath>
+              <IncludePath>.\Hardware;.\Library;.\Start;.\System;.\User;.\FreeRTOS\inc;.\FreeRTOS\src;.\Config</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -489,6 +489,26 @@
               <FileName>bh150.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Hardware\bh150.h</FilePath>
+            </File>
+            <File>
+              <FileName>lm393.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\lm393.c</FilePath>
+            </File>
+            <File>
+              <FileName>lm393.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\lm393.h</FilePath>
+            </File>
+            <File>
+              <FileName>sensor_manager.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\sensor_manager.c</FilePath>
+            </File>
+            <File>
+              <FileName>sensor_manager.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\sensor_manager.h</FilePath>
             </File>
           </Files>
         </Group>
@@ -789,6 +809,31 @@
               <FileName>timers.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\FreeRTOS\src\timers.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>Config</GroupName>
+          <Files>
+            <File>
+              <FileName>sensor_type.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Config\sensor_type.h</FilePath>
+            </File>
+            <File>
+              <FileName>slave_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Config\slave_config.h</FilePath>
+            </File>
+            <File>
+              <FileName>slave_node_01.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Config\slave_node_01.h</FilePath>
+            </File>
+            <File>
+              <FileName>slave_node_02.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Config\slave_node_02.h</FilePath>
             </File>
           </Files>
         </Group>

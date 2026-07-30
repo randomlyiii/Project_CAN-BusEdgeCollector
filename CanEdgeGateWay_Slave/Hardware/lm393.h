@@ -24,6 +24,6 @@
 /* ---- API ---- */
 void     Lm393_Init(void);
 uint8_t  Lm393_ReadDigital(void);            /* 0 = bright, 1 = dark */
-uint16_t Lm393_ReadAnalog(void);             /* raw ADC value 0~4095 */
+uint8_t  Lm393_ReadAnalog(uint16_t *adc_val); /* 0=OK, 1=timeout; adc_val 0~4095 or 0xFFFF */
 
 #endif /* __LM393_H */

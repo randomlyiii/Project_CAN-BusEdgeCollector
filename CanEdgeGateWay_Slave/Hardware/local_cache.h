@@ -44,5 +44,6 @@ void     LocalCache_OnTxSuccess(LocalCache *cache);
 void     LocalCache_OnTxFail(LocalCache *cache);
 uint8_t  LocalCache_IsOffline(LocalCache *cache);
 uint8_t  LocalCache_ShouldReplay(LocalCache *cache);
+void     LocalCache_Cleanup(LocalCache *cache);
 
 #endif /* __LOCAL_CACHE_H */

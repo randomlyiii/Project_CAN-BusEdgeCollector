@@ -19,6 +19,7 @@ void Lm393_Init(void)
 {
     GPIO_InitTypeDef  gpio;
     ADC_InitTypeDef   adc;
+    uint32_t timeout;
 
     /* ---- GPIO clocks ---- */
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB | RCC_APB2Periph_ADC1, ENABLE);
@@ -49,12 +50,19 @@ void Lm393_Init(void)
     adc.ADC_NbrOfChannel       = 1;
     ADC_Init(ADC1, &adc);
 
-    /* Calibrate ADC */
+    /* Calibrate ADC (with timeout — some boards may hang) */
     ADC_Cmd(ADC1, ENABLE);
     ADC_ResetCalibration(ADC1);
-    while (ADC_GetResetCalibrationStatus(ADC1)) { }
+    timeout = 100000;
+    while (ADC_GetResetCalibrationStatus(ADC1)) {
+        if (--timeout == 0) break;
+    }
+
     ADC_StartCalibration(ADC1);
-    while (ADC_GetCalibrationStatus(ADC1)) { }
+    timeout = 100000;
+    while (ADC_GetCalibrationStatus(ADC1)) {
+        if (--timeout == 0) break;
+    }
     ADC_Cmd(ADC1, DISABLE);
 }
 
@@ -68,23 +76,35 @@ uint8_t Lm393_ReadDigital(void)
     return (GPIO_ReadInputDataBit(LM393_DO_PORT, LM393_DO_PIN) == Bit_RESET) ? 0 : 1;
 }
 
-/* ==================== Analog Read (AO) ==================== */
+/* ==================== Analog Read (AO) ====================
+ *
+ * 返回 0=成功, 1=转换超时
+ * adc_val 在超时时写入 0xFFFF 以标识异常。
+ * ========================================================== */
 
-uint16_t Lm393_ReadAnalog(void)
+uint8_t Lm393_ReadAnalog(uint16_t *adc_val)
 {
-    uint16_t adc_val;
+    uint16_t val;
 
     /* Configure channel, sample, convert, read */
     ADC_RegularChannelConfig(ADC1, LM393_ADC_CHANNEL, 1, ADC_SampleTime_55Cycles5);
-
     ADC_Cmd(ADC1, ENABLE);
 
-    /* Single conversion */
+    /* Single conversion (with timeout) */
     ADC_SoftwareStartConvCmd(ADC1, ENABLE);
-    while (!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC)) { }
+    {
+        uint32_t to = 100000;
+        while (!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC)) {
+            if (--to == 0) {
+                ADC_Cmd(ADC1, DISABLE);
+                *adc_val = 0xFFFF;          /* 超时标记 */
+                return 1;                   /* 转换超时 */
+            }
+        }
+    }
 
-    adc_val = ADC_GetConversionValue(ADC1);
+    val = ADC_GetConversionValue(ADC1);
     ADC_Cmd(ADC1, DISABLE);
-
-    return adc_val;
+    *adc_val = val;
+    return 0;                               /* 成功 */
 }
