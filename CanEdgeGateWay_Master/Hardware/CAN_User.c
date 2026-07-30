@@ -1,10 +1,17 @@
 /**
- * CAN User Layer — Phase 2 (FreeRTOS task-driven)
+ * CAN User Layer — Final Phase (ISR-only-copy + sequential task drain)
  *
- * ISR responsibility: read frame + give semaphore (sub-50us)
- * vTask_CAN_Rx:   consume semaphore, classify frame, push to FIFO
- * vTask_CAN_Monitor: bus load, error state machine, escalation/de-escalation
- * vTask_CAN_Tx:   pop from FIFO, transmit with priority ordering
+ * Architecture (dual-FIFO + dual lock-free ring buffer):
+ *
+ *   [HW FIFO0: 紧急 0x100-0x1FF]  →  CAN1_RX0_IRQHandler
+ *   [HW FIFO1: 常态 0x200-0x3FF]  →  CAN1_RX1_IRQHandler
+ *        ↓ (ISR 只搬运，不解析，各写各的 ring)
+ *   ring_push → g_rx_ring_high / g_rx_ring_norm (锁无关 SPSC)
+ *        ↓ (Task 10ms 周期 drain)
+ *   ring_pop → CAN_ProcessFrame (业务逻辑在这里)
+ *
+ * ISR 只做三件事: CAN_Receive → ring_push → 清 IT 标志 → 退出
+ * Task 绝对不碰硬件 FIFO，ISR 绝对不做协议解析
  */
 
 #include "CAN_User.h"
@@ -19,15 +26,42 @@ volatile uint32_t   g_can_rx_int_count  = 0;
 volatile uint32_t   g_can_rx_temp_count = 0;
 volatile uint16_t   g_bus_off_recovery_cnt = 0;
 volatile uint8_t    g_system_throttle_level = 0;  /* 0=norm, 1=low, 2=emerg */
+uint8_t             g_boff_consec = 0;     /* 连续 BusOff 计数, 收到帧时清零 */
 
 /* ---- FreeRTOS sync objects ---- */
-SemaphoreHandle_t   g_can_rx_sem          = NULL;
-SemaphoreHandle_t   g_can_fifo_not_empty  = NULL;
-SemaphoreHandle_t   g_can_monitor_sem     = NULL;
+/* DBG: 运行计数 — 挂死前最后值定位卡死段 */
+volatile uint8_t g_dbg_step = 0;
+
+/* NOTE: RX path uses lock-free ring buffers (g_rx_ring_high/norm).
+ *       Semaphore-free periodic drain — see main.c Task_Unified.
+ *       TX FIFO 不再推入，不再需要信号量。 */
+
+/* ---- RX Ring Buffers (ISR → Task, lock-free SPSC, each ring own ISR) ---- */
+RxRingBuf           g_rx_ring_high;
+RxRingBuf           g_rx_ring_norm;
+
+/* ================================================================
+ * Ring Buffer Operations — 单生产者(ISR)/单消费者(Task)
+ *
+ * 约束:
+ *   深度必须为 2 的幂 → 用 & MASK 代替 % 取模
+ *   满判据留空一格: (head+1) & MASK == tail
+ *   uint8_t 索引在 32 位 MCU 上是单字节原子操作
+ * ================================================================ */
+static inline uint8_t ring_push(RxRingBuf *rb, CanRxMsg *msg)
+{
+    uint8_t next = (uint8_t)((rb->head + 1) & RX_RING_MASK);
+    if (next == rb->tail) {
+        rb->overflow_cnt++;
+        return 1;  /* 环形缓冲满 */
+    }
+    rb->frames[rb->head] = *msg;
+    rb->head = next;
+    return 0;
+}
 
 /* ---- ISR → task shared frame buffer ---- */
 CanRxFrame          g_isr_rx_frame;
-static volatile BaseType_t g_rx_higher_prio_woken = pdFALSE;
 
 /* ---- Load calculation ---- */
 static uint32_t g_tx_bit_count   = 0;
@@ -72,10 +106,17 @@ static void CAN_NVIC_Init(void)
     NVIC_InitTypeDef nvic;
 
     /* CAN RX0 interrupt — priority 5 (≥ configMAX_SYSCALL_INTERRUPT_PRIORITY).
-     * Must be ≥5 to safely call xSemaphoreGiveFromISR / portYIELD_FROM_ISR.
+     * Must be ≥5 to safely call FreeRTOS ISR functions.
      * Priorities 0-4 are NOT masked by FreeRTOS BASEPRI critical sections. */
     nvic.NVIC_IRQChannel                   = USB_LP_CAN1_RX0_IRQn;
-    nvic.NVIC_IRQChannelPreemptionPriority = 5;
+    nvic.NVIC_IRQChannelPreemptionPriority = 8;     /* < configMAX_SYSCALL(5), 不干扰调度 */
+    nvic.NVIC_IRQChannelSubPriority        = 0;
+    nvic.NVIC_IRQChannelCmd                = ENABLE;
+    NVIC_Init(&nvic);
+
+    /* CAN RX1 interrupt (FIFO1 — normal/low-freq frames) */
+    nvic.NVIC_IRQChannel                   = CAN1_RX1_IRQn;
+    nvic.NVIC_IRQChannelPreemptionPriority = 8;     /* 同 FIFO0 优先级 */
     nvic.NVIC_IRQChannelSubPriority        = 0;
     nvic.NVIC_IRQChannelCmd                = ENABLE;
     NVIC_Init(&nvic);
@@ -88,16 +129,44 @@ static void CAN_NVIC_Init(void)
     NVIC_Init(&nvic);
 }
 
-/* ==================== CAN Init ==================== */
+/* ==================== CAN Hardware Init (不碰 g_slave_nodes) ====================
+ *
+ * 返回 0=成功, 1=CAN_Init 失败(总线持续显性/时钟异常).
+ * 调用方不应死等, 应由 ErrorMonitor 限频重试.
+ * ================================================================ */
 
-void CAN_User_Init(void)
+static uint8_t CAN_Hardware_Init(void)
 {
     CAN_InitTypeDef       can;
     CAN_FilterInitTypeDef filter;
-    uint8_t i;
 
-    memset(g_slave_nodes, 0, sizeof(g_slave_nodes));
-    memset(g_priority_override, 0, sizeof(g_priority_override));
+    /* 注意: 不在此清除 error_level — 只有调用方知道这次初始化是首启还是 BusOff 恢复,
+     *       若调用方在恢复期间失败, error_level 应保持 3 以便 ErrorMonitor 下次再试.
+     *       清零时机在 CAN_Init 成功后由调用方处理. */
+
+    CAN_GPIO_Init();
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_CAN1, ENABLE);
+
+    can.CAN_TTCM       = DISABLE;
+    can.CAN_ABOM       = DISABLE;  /* ErrorMonitor 软件恢复(1s退避), 避免 ABOM 2.8ms 快速恢复
+                                      导致 2 节点下 BusOff↔Normal 高频震荡, 永远收不到帧.
+                                      3 节点 OK, 2 节点 WRN R=0 的观测证实此问题. */
+    can.CAN_AWUM       = DISABLE;
+    can.CAN_NART       = DISABLE;  /* 原始: 自动重传 */
+    can.CAN_RFLM       = DISABLE;
+    can.CAN_TXFP       = DISABLE;
+    can.CAN_Mode       = CAN_Mode_Normal;
+    /* 500kbps: 36MHz/(6×12tq)=500kbps. 采样点从 50%(5,6) 改为 75%(8,3).
+       75% 采样点更适合 2 节点下的信号完整性, 降低 CRC 错误率.
+       阶段二原始时序为 5,6 (50%), 3 节点正常但 2 节点频繁 CRC 错. */
+    can.CAN_SJW        = CAN_SJW_2tq;
+    can.CAN_BS1        = CAN_BS1_8tq;
+    can.CAN_BS2        = CAN_BS2_3tq;
+    can.CAN_Prescaler  = 6;
+    if (CAN_Init(CAN1, &can) == CANINITFAILED)
+        return 1;  /* 调用方重试, 不死循环 */
+
+    /* CAN_Init 成功 → 安全清除错误计数器 */
     g_can_error.error_level   = 0;
     g_can_error.tec           = 0;
     g_can_error.rec           = 0;
@@ -106,95 +175,141 @@ void CAN_User_Init(void)
     g_system_throttle_level   = 0;
     g_bus_off_recovery_cnt    = 0;
 
-    CAN_GPIO_Init();
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_CAN1, ENABLE);
-
-    can.CAN_TTCM       = DISABLE;
-    can.CAN_ABOM       = DISABLE; /* 匹配厂家参考: 关自动 Bus-Off 恢复 */
-    can.CAN_AWUM       = DISABLE; /* 匹配厂家参考: 关自动唤醒 */
-    can.CAN_NART       = DISABLE;
-    can.CAN_RFLM       = DISABLE;
-    can.CAN_TXFP       = DISABLE;
-    can.CAN_Mode       = CAN_Mode_Normal;
-    /* 500kbps: 36MHz/(6×12tq)=500kbps, SJW=2tq 容忍晶振偏差 ~1500ppm */
-    can.CAN_SJW        = CAN_SJW_2tq;
-    can.CAN_BS1        = CAN_BS1_5tq;
-    can.CAN_BS2        = CAN_BS2_6tq;
-    can.CAN_Prescaler  = 6;
-    CAN_Init(CAN1, &can);
-
-    /* Accept ALL standard frames */
+    /* ================================================================
+     * 全通 Filter — 所有帧接收, 不分优先级
+     *   (之前双 Filter 可能 ID 范围未覆盖从站帧导致 RX=0)
+     * ================================================================ */
     filter.CAN_FilterNumber           = 0;
     filter.CAN_FilterMode             = CAN_FilterMode_IdMask;
     filter.CAN_FilterScale            = CAN_FilterScale_32bit;
     filter.CAN_FilterIdHigh           = 0x0000;
     filter.CAN_FilterIdLow            = 0x0000;
-    filter.CAN_FilterMaskIdHigh       = 0x0000;
+    filter.CAN_FilterMaskIdHigh       = 0x0000;   /* 全 0 = 全部接受 */
     filter.CAN_FilterMaskIdLow        = 0x0000;
-    filter.CAN_FilterFIFOAssignment   = CAN_FIFO0;
+    filter.CAN_FilterFIFOAssignment   = CAN_FIFO0; /* 所有帧走 FIFO0 */
     filter.CAN_FilterActivation       = ENABLE;
     CAN_FilterInit(&filter);
 
-    /* Create FreeRTOS sync objects FIRST — before enabling ANY CAN interrupt.
-     * If an ISR fires before its semaphore is created, xSemaphoreGiveFromISR
-     * receives NULL → configASSERT → infinite loop.  (freertos_standard.md §13) */
-    g_can_rx_sem         = xSemaphoreCreateBinary();
-    g_can_fifo_not_empty = xSemaphoreCreateBinary();
-    g_can_monitor_sem    = xSemaphoreCreateBinary();
+    /* Init RX ring buffers */
+    memset(&g_rx_ring_high, 0, sizeof(g_rx_ring_high));
+    memset(&g_rx_ring_norm, 0, sizeof(g_rx_ring_norm));
 
     /* FIFO init (creates mutexes — must also be done before interrupts) */
     FIFO_Init();
 
-    /* CAN 中断延后到调度器启动前一刻再使能 (main.c 中调用 CAN_EnableInterrupts())
-     * 防止初始化阶段 OLED I2C 被优先级 0 的 CAN ISR 打断 */
-    /* (移到了 CAN_EnableInterrupts() 中) */
-
-    /* Init slave node records */
-    for (i = 0; i < MAX_SLAVE_NODES; i++) {
-        g_slave_nodes[i].node_id = i + 1;
-        g_slave_nodes[i].online  = 0;
-    }
-
     g_window_start = Delay_GetTick();
     g_last_bus_activity = Delay_GetTick();
+    return 0;
+}
+
+/* ==================== CAN Full Init (硬件 + 节点记录) ==================== */
+
+void CAN_User_Init(void)
+{
+    uint8_t i;
+
+    memset(g_slave_nodes, 0, sizeof(g_slave_nodes));
+    memset(g_priority_override, 0, sizeof(g_priority_override));
+
+    /* 首次初始化: 可以重试, 但不应死等 */
+    {
+        uint8_t retry = 5;
+        while (retry--) {
+            if (CAN_Hardware_Init() == 0) break;
+            Delay_ms(100);
+        }
+        /* CAN_Hardware_Init 成功后已在内部清零 error_level.
+         * 若全部重试失败, 保持 error_level 为之前状态 (3=BusOff 或 0). */
+    }
+
+    /* 预填 2 个已知从站 ID, 其余留空(slot=0)支持动态注册 */
+    for (i = 0; i < MAX_SLAVE_NODES; i++) {
+        g_slave_nodes[i].online = 0;
+        if (i < 2)
+            g_slave_nodes[i].node_id = i + 1;   /* slave 1, 2 */
+    }
 }
 
 /* ==================== CAN Enable Interrupts (delayed) ==================== */
 
 void CAN_EnableInterrupts(void)
 {
-    /* 延迟使能 CAN 中断 — 到调度器启动前一刻才开,
-       避免初始化阶段(OLED 显示等)被优先级 0 的 CAN ISR 打断 I2C 时序 */
-    CAN_ITConfig(CAN1, CAN_IT_FMP0, ENABLE);
-    CAN_ITConfig(CAN1, CAN_IT_ERR, ENABLE);
-    CAN_ITConfig(CAN1, CAN_IT_BOF, ENABLE);
+    /* 全部 CAN 中断禁用 — FIFO0 由 Task 轮询, FIFO1 无帧.
+       之前开启 FMP1 中断可能导致 CAN 控制器检查空 FIFO1 时产生内部状态异常. */
+    // CAN_ITConfig(CAN1, CAN_IT_FMP0, DISABLE);
+    // CAN_ITConfig(CAN1, CAN_IT_FMP1, DISABLE);
+    // CAN_ITConfig(CAN1, CAN_IT_ERR, DISABLE);
+    // CAN_ITConfig(CAN1, CAN_IT_BOF, DISABLE);
     CAN_NVIC_Init();
 }
 
-/* ==================== CAN Reset (enhanced Bus-Off recovery) ==================== */
+/* ==================== CAN BusOff 恢复 (INRQ 退出初始化模式) ====================
+ *
+ * 不再使用 CAN_DeInit + CAN_Hardware_Init (软件全复位违反 CAN 协议).
+ * 改为 INRQ 进入/退出初始化模式 → 硬件自动完成 128 隐性位检测 → 恢复.
+ * 时序寄存器保持不变, 无需重配.
+ *
+ * 参考: RM0008 §25.7.4 / 工程实操笔记 §5
+ * ================================================================ */
 
 void CAN_ResetBus(void)
 {
-    CAN_DeInit(CAN1);
-    Delay_ms(10);
-    CAN_User_Init();
+    uint32_t timeout;
+    uint8_t  ok = 0;
+    CanRxMsg dummy;
 
-    /* FIXME: CAN_User_Init() recreates semaphores → tasks blocked on old handles
-     * will never wake from new ISR signals. Proper fix: separate HW init from
-     * RTOS object creation. For now, BusOff recovery restores CAN TX (emergency
-     * frame below) but RX path is broken until system restart. */
+    /* Step 1: 请求进入初始化模式 (INRQ=1) */
+    CAN1->MCR |= CAN_MCR_INRQ;
 
-    /* Re-enable CAN interrupts — CAN_User_Init() leaves them off */
-    CAN_EnableInterrupts();
+    /* Step 2: 等待 INAK 确认 (最长 ~1ms, 开 5000 循环保险) */
+    timeout = 5000;
+    while (!(CAN1->MSR & CAN_MSR_INAK)) {
+        if (--timeout == 0) { ok = 0; goto finish; }
+    }
 
+    /* Step 3: 清 LEC 记录 (不写 ESR, LEC 自动清除) */
+
+    /* Step 4: 退出初始化模式 (INRQ=0), 硬件走 128 隐性位恢复 */
+    CAN1->MCR &= ~(uint32_t)CAN_MCR_INRQ;
+
+    /* Step 5: 等待 INAK 清除, 确认回到正常模式 */
+    timeout = 5000;
+    while ((CAN1->MSR & CAN_MSR_INAK)) {
+        if (--timeout == 0) { ok = 0; goto finish; }
+    }
+    ok = 1;
+
+    /* 等待硬件完成 128 隐性位检测 (ESR.BOFF 自动清零) */
+    {
+        uint32_t poll;
+        for (poll = 0; poll < 20000; poll++) {   /* ~20ms 最大等待 */
+            if (!(CAN1->ESR & ((uint32_t)0x00000004)))  /* BOFF bit */
+                break;
+            Delay_us(1);
+        }
+    }
+
+    /* Drain FIFO0 脏帧 (恢复期间可能堆积错误帧) */
+    for (uint8_t i = 0; i < 6; i++) {
+        if (CAN_MessagePending(CAN1, CAN_FIFO0) > 0)
+            CAN_Receive(CAN1, CAN_FIFO0, &dummy);
+    }
+
+    g_can_error.tec = 0;
+    g_can_error.rec = 0;
+    g_can_error.error_level = 0;
     g_bus_off_recovery_cnt++;
 
-    /* Send emergency Bus-Off recovery frame */
-    uint8_t data[8] = {0};
-    data[CAN_DATA_TYPE_IDX]  = 0;  /* priority 0 */
-    data[CAN_DATA_SRC_IDX]   = 0xFE;  /* Master node ID */
-    data[CAN_DATA_FUNC_IDX]  = CAN_FUNC_BUSOFF_RECOVERY;
-    CAN_SendFrame(CAN_ID_EMERGENCY_BASE, data, 8);
+    return;
+
+finish:
+    if (!ok) {
+        /* INRQ 超时: 总线持续显性导致无法同步?
+         * 留 error_level=3, 让 ErrorMonitor 下次冷却到期再试. */
+        CAN1->MCR &= ~(uint32_t)CAN_MCR_INRQ;  /* 无论如何退出 init */
+        g_can_error.error_level = 3;
+        return;
+    }
 }
 
 /* ==================== Frame Send ==================== */
@@ -213,8 +328,11 @@ uint8_t CAN_SendFrame(uint32_t id, uint8_t *data, uint8_t len)
     tx_msg.DLC   = len;
     for (i = 0; i < len; i++) tx_msg.Data[i] = data[i];
 
-    timeout = 1000;
     mailbox = CAN_Transmit(CAN1, &tx_msg);
+    if (mailbox == CAN_TxStatus_NoMailBox)
+        return 1;                                   /* 无空闲邮箱 */
+
+    timeout = 1000;
     while (timeout--) {
         if (CAN_TransmitStatus(CAN1, mailbox) == CAN_TxStatus_Ok)
             goto send_ok;
@@ -228,68 +346,45 @@ send_ok:
     return 0;
 }
 
-/* ==================== ISR: CAN RX (ultra-fast — just read + signal) ==================== */
+/* ================================================================
+ * ISR: CAN FIFO0 Receive — 禁用
+ *
+ * FIFO0 帧由 Task 轮询读取（已验证 ISR 方案导致调度器异常）
+ * ================================================================ */
 
 void CAN1_RX0_IRQHandler(void)
 {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-    while (CAN_GetITStatus(CAN1, CAN_IT_FMP0) != RESET) {
-        CanRxMsg msg;
-        CAN_Receive(CAN1, CAN_FIFO0, &msg);
-
-        /* Copy to static buffer for task consumption */
-        g_isr_rx_frame.StdId = msg.StdId;
-        g_isr_rx_frame.IDE   = msg.IDE;
-        g_isr_rx_frame.RTR   = msg.RTR;
-        g_isr_rx_frame.DLC   = msg.DLC;
-        g_isr_rx_frame.FMI   = msg.FMI;
-        memcpy(g_isr_rx_frame.Data, msg.Data, 8);
-
-        CAN_ClearITPendingBit(CAN1, CAN_IT_FMP0);
-
-        /* Signal the CAN Rx task */
-        xSemaphoreGiveFromISR(g_can_rx_sem, &xHigherPriorityTaskWoken);
-    }
-
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    /* 未使用 — FIFO0 由 Task_Unified 轮询 */
 }
 
-/* ==================== ISR: CAN Error ==================== */
+/* ================================================================
+ * ISR: CAN FIFO1 Receive (常态+低频帧 0x200-0x3FF)
+ *
+ * 职责 ONLY: 读硬件 → 推环形缓冲 → 退出
+ * ================================================================ */
+
+void CAN1_RX1_IRQHandler(void)
+{
+    while (CAN_GetITStatus(CAN1, CAN_IT_FMP1) != RESET) {
+        CanRxMsg msg;
+        CAN_Receive(CAN1, CAN_FIFO1, &msg);
+        ring_push(&g_rx_ring_norm, &msg);
+        CAN_ClearITPendingBit(CAN1, CAN_IT_FMP1);
+    }
+}
+
+/* ================================================================
+ * ISR: CAN Status Change / Error — 禁用 (ERR/BOF 中断未使能)
+ *
+ * 拔线时反射产生连续位错误 → SCE ISR 风暴抢占 Task CPU →
+ * Task 不能 drain ring → 心跳超时 → 全部掉线。
+ * 现 ErrorMonitor 已不调 CAN_ResetBus, SCE 数据仅用于诊断,
+ * 关闭 SCE 中断消除 ISR 风暴, 保住正常帧接收路径。
+ * ================================================================ */
 
 void CAN1_SCE_IRQHandler(void)
 {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    uint8_t tec, rec;
-
-    if (CAN_GetITStatus(CAN1, CAN_IT_ERR) != RESET) {
-        tec = (uint8_t)((CAN1->ESR >> 16) & 0xFF);
-        rec = (uint8_t)((CAN1->ESR >> 24) & 0xFF);
-        g_can_error.tec = tec;
-        g_can_error.rec = rec;
-
-        if (CAN1->ESR & ((uint32_t)0x00000004))  /* BOFF bit */
-            g_can_error.error_level = 3;
-        else if (tec > 127 || rec > 127)
-            g_can_error.error_level = 2;
-        else if (tec > 96 || rec > 96)
-            g_can_error.error_level = 1;
-        else
-            g_can_error.error_level = 0;
-
-        CAN_User_OnError(g_can_error.error_level);
-        CAN_ClearITPendingBit(CAN1, CAN_IT_ERR);
-
-        /* Signal monitor task */
-        xSemaphoreGiveFromISR(g_can_monitor_sem, &xHigherPriorityTaskWoken);
-    }
-
-    if (CAN_GetITStatus(CAN1, CAN_IT_BOF) != RESET) {
-        CAN_ClearITPendingBit(CAN1, CAN_IT_BOF);
-        g_can_error.error_level = 3;
-    }
-
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    /* ERR/BOF 中断已禁用, 此函数不应被执行 */
 }
 
 /* ==================== Process one frame (called from vTask_CAN_Rx) ==================== */
@@ -301,6 +396,13 @@ void CAN_ProcessFrame(CanRxFrame *p)
     uint8_t  prio   = p->Data[CAN_DATA_TYPE_IDX];
     uint32_t now    = Delay_GetTick();
     uint8_t  i, found;
+
+    /* DLC 校验: 协议约定 8 字节 */
+    if (p->DLC != 8) {
+        static uint32_t dlc_err = 0;
+        if (++dlc_err < 10);  /* 忽略, 仅占位 */
+        return;
+    }
 
     g_can_rx_int_count++;
     g_rx_bit_count += CAN_FRAME_BITS;
@@ -321,6 +423,15 @@ void CAN_ProcessFrame(CanRxFrame *p)
         }
     }
     if (!found) return;
+    if (i >= MAX_SLAVE_NODES) return;   /* 安全边界校验 */
+
+    /* 任何来自该节点的帧都证明它存活 — 重置所有离线判定 */
+    g_slave_nodes[i].online = 1;
+    g_slave_nodes[i].stale = 0;
+    g_slave_nodes[i].offline = 0;
+    g_slave_nodes[i].expire_start_tick = 0;
+    g_slave_nodes[i].last_heartbeat_tick = now;
+    g_boff_consec = 0;  /* 收到帧 → 总线正常, 清零连续 BusOff 计数 */
 
     /* Check priority override */
     if (g_priority_override[i].overridden && prio != 0) {
@@ -328,30 +439,14 @@ void CAN_ProcessFrame(CanRxFrame *p)
         p->Data[CAN_DATA_TYPE_IDX] = 0;
     }
 
-    /* Blacklist check: block temp/humi from blacklisted nodes */
-    if (g_slave_nodes[i].blacklist
-        && func != CAN_FUNC_RECOVER
-        && func != CAN_FUNC_HEARTBEAT
-        && func != CAN_FUNC_ALARM)
-        return;
-
-    /* Heartbeat/alarm from blacklisted node → auto unblock */
-    if (g_slave_nodes[i].blacklist
-        && (func == CAN_FUNC_HEARTBEAT || func == CAN_FUNC_ALARM))
-        g_slave_nodes[i].blacklist = 0;
-
     /* Process by function code */
     switch (func) {
     case CAN_FUNC_HEARTBEAT:
-        g_slave_nodes[i].last_heartbeat_tick = now;
         g_slave_nodes[i].heartbeat_count++;
-        g_slave_nodes[i].online = 1;
         break;
 
     case CAN_FUNC_TEMP_HUMI:
         g_can_rx_temp_count++;
-        g_slave_nodes[i].last_heartbeat_tick = now;
-        g_slave_nodes[i].online = 1;
         g_slave_nodes[i].temp_int = p->Data[CAN_DATA_PAYLOAD_IDX];
         g_slave_nodes[i].temp_dec = p->Data[CAN_DATA_PAYLOAD_IDX + 1];
         g_slave_nodes[i].humi_int = p->Data[CAN_DATA_PAYLOAD_IDX + 2];
@@ -360,88 +455,156 @@ void CAN_ProcessFrame(CanRxFrame *p)
 
     case CAN_FUNC_ALARM:
         g_slave_nodes[i].fault_flag = 1;
-        g_slave_nodes[i].online = 1;
-        g_slave_nodes[i].last_heartbeat_tick = now;
         CAN_User_OnAlarm(src_id, func);
         break;
 
     case CAN_FUNC_RECOVER:
         g_slave_nodes[i].fault_flag = 0;
-        g_slave_nodes[i].blacklist = 0;
-        g_slave_nodes[i].online = 1;
-        g_slave_nodes[i].last_heartbeat_tick = now;
         break;
 
     case CAN_FUNC_LIGHT:
+        /* Dual-use: BH1750 lux OR LM393 AO analog (same payload format) */
         g_slave_nodes[i].light_lux =
             ((uint16_t)p->Data[CAN_DATA_PAYLOAD_IDX] << 8)
             | p->Data[CAN_DATA_PAYLOAD_IDX + 1];
-        /* keep node online */
-        g_slave_nodes[i].last_heartbeat_tick = now;
-        g_slave_nodes[i].online = 1;
+        g_slave_nodes[i].lm393_analog = g_slave_nodes[i].light_lux;
+        g_slave_nodes[i].lm393_digital = p->Data[CAN_DATA_PAYLOAD_IDX + 2];
+        break;
+
+    case CAN_FUNC_LM393_DO:
+        g_slave_nodes[i].lm393_digital = p->Data[CAN_DATA_PAYLOAD_IDX];
+        break;
+
+    case CAN_FUNC_RESERVED:
+        g_slave_nodes[i].reserved_ch1 =
+            ((uint16_t)p->Data[CAN_DATA_PAYLOAD_IDX] << 8)
+            | p->Data[CAN_DATA_PAYLOAD_IDX + 1];
         break;
     }
 
-    /* Push to dual FIFO based on priority */
-    if (prio == 0) {
+    /* 推入 FIFO (按优先级分流).
+     * 主站 receive-only, 不自发帧, 不存在自接收回环问题.
+     * FIFO 数据由 ModbusTCP_SyncFromCAN 消费 → 历史缓存 → 断网恢复后批量上传. */
+    if (prio == 0)
         FIFO_High_Push(p);
-    } else {
+    else
         FIFO_Normal_Push(p);
-    }
-
-    /* Wake CAN Tx task — NOTE: CAN_ProcessFrame runs in TASK context (Task_CAN_Rx).
-     * Use xSemaphoreGive(), NOT xSemaphoreGiveFromISR().
-     * FromISR writes to scheduler event lists without proper locking in task context,
-     * corrupting the scheduler state and causing system hang.  (freertos_standard.md §15) */
-    xSemaphoreGive(g_can_fifo_not_empty);
 }
 
 /* ==================== Heartbeat check (called from vTask_CAN_Monitor) ==================== */
 
 void CAN_HeartBeatCheck(void)
 {
-    uint32_t now = Delay_GetTick();
-    for (uint8_t i = 0; i < MAX_SLAVE_NODES; i++) {
+    uint32_t now;
+    uint8_t i;
+
+    /* BusOff(3) 时 master 控制器收不到任何帧, 但不代表 slave 掉线.
+     * Error Passive(2) 时接收可能也不稳定. 跳过检测防止假离线. */
+    if (g_can_error.error_level >= 2)
+        return;
+
+    now = Delay_GetTick();
+
+    for (i = 0; i < MAX_SLAVE_NODES; i++) {
         if (g_slave_nodes[i].node_id == 0) continue;
-        if (g_slave_nodes[i].online) {
-            if (now - g_slave_nodes[i].last_heartbeat_tick > HEARTBEAT_TIMEOUT_MS) {
-                g_slave_nodes[i].online = 0;
-                g_slave_nodes[i].heartbeat_count = 0;
-                CAN_User_OnNodeUpdate(g_slave_nodes[i].node_id);
-            }
-        }
-        if (!g_slave_nodes[i].online && !g_slave_nodes[i].blacklist
-            && g_slave_nodes[i].node_id != 0) {
-            g_slave_nodes[i].blacklist = 1;
-            g_slave_nodes[i].blacklist_start_tick = now;
-        }
-        if (g_slave_nodes[i].blacklist) {
-            if (now - g_slave_nodes[i].blacklist_start_tick > NODE_BLACKLIST_TIMEOUT_MS)
-                g_slave_nodes[i].blacklist = 0;
+        if (!g_slave_nodes[i].online) continue;
+
+        uint32_t delta = now - g_slave_nodes[i].last_heartbeat_tick;
+
+        if (delta > STALE_TIMEOUT_MS) {
+            /* 超过 3s → 进入过期 */
+            g_slave_nodes[i].stale = 1;
+
+            /* 刚进入过期, 记录起始时间戳 (只在 stale 首次置位时打) */
+            if (g_slave_nodes[i].expire_start_tick == 0)
+                g_slave_nodes[i].expire_start_tick = now;
+
+            /* 持续过期超过 30s → 判长期离线 */
+            if (now - g_slave_nodes[i].expire_start_tick > OFFLINE_CONFIRM_MS)
+                g_slave_nodes[i].offline = 1;
+        } else {
+            /* 帧在 3s 内收到 → 清除过期标记 */
+            g_slave_nodes[i].stale = 0;
+            g_slave_nodes[i].offline = 0;
+            g_slave_nodes[i].expire_start_tick = 0;
         }
     }
 }
 
-/* ==================== Error monitor + Bus-Off recovery ==================== */
+/* ==================== Error monitor + Bus-Off recovery ====================
+ *
+ * ABOM=DISABLE: 2 节点信号完整性差(终端阻抗匹配), 恢复后收 1-2 帧又 BusOff.
+ * 固定 200ms 恢复: 确保 STALE_TIMEOUT(3s) 内完成多次恢复, 总有帧能刷新 timestamp.
+ * 3 节点完美运行, 2 节点有 WRN/BOF 循环.
+ *
+ * 恢复机制:
+ *   - 正常 BusOff → 200ms 恢复 (2 节点每恢复收 1-2 帧又 BusOff)
+ *   - 连续 5 次 BusOff → 拉长到 3s, 避免无效高频重置
+ *   - CAN_ProcessFrame 收到帧时清零连续计数 (见 CAN_ProcessFrame 顶部)
+ * ================================================================ */
+#define BOFF_COOLDOWN_MS        200
+#define BOFF_COOLDOWN_MAX_MS   3000
+#define BOFF_CONSEC_THRESH     5
+#define BOFF_STABLE_RESET_MS   30000
 
 void CAN_ErrorMonitor(void)
 {
-    uint8_t i;
+    static uint32_t last_recover_tick = 0;
+    static uint32_t ok_since = 0;
+    static uint8_t  boff_counted = 0;   /* 边沿检测: 每次 BusOff 事件仅累加一次 */
 
-    if (g_can_error.error_level == 3) {
-        /* Bus-Off: stop Tx task, clear FIFOs, reset CAN, send recovery frame */
-        CAN_ResetBus();
+    uint32_t esr = CAN1->ESR;
+    uint8_t  tec = (uint8_t)((esr >> 16) & 0xFF);
+    uint8_t  rec = (uint8_t)((esr >> 24) & 0xFF);
 
-        /* Elevate ALL frames to priority 0 */
-        for (i = 0; i < MAX_SLAVE_NODES; i++) {
-            if (g_slave_nodes[i].node_id != 0 && !g_priority_override[i].overridden) {
-                g_priority_override[i].overridden       = 1;
-                g_priority_override[i].original_prio    = 1;
-                g_priority_override[i].escalate_tick    = Delay_GetTick();
-                g_priority_override[i].escalation_reason = 3;
-            }
+    g_can_error.tec = tec;
+    g_can_error.rec = rec;
+
+    /* 若 error_level==3 是被 CAN_ResetBus 强制设置的(硬件 init 失败但 ESR 已被 DeInit 清空),
+     * 不要被 ESR 覆盖掉, 否则 ErrorMonitor 以为总线正常, 永不触发恢复. */
+    if (g_can_error.error_level != 3) {
+        if (esr & ((uint32_t)0x00000004)) {
+            g_can_error.error_level = 3;
+        } else if (tec > 96 || rec > 96) {
+            g_can_error.error_level = 1;
+        } else {
+            g_can_error.error_level = 0;
         }
     }
+
+    /* ---- BusOff 恢复: 连续 N 次后拉长间隔 ----
+     * 边沿检测: 用 boff_counted 标记是否已为本次 BusOff 事件累加.
+     * 避免 10ms 周期内在等待冷却期间重复累加导致过早拉长到 3s.
+     * boff_counted 在退出 error_level==3 时清零. */
+    if (g_can_error.error_level == 3) {
+        uint32_t now = Delay_GetTick();
+        uint32_t cooldown = BOFF_COOLDOWN_MS;
+
+        if (!boff_counted) {
+            g_boff_consec++;
+            boff_counted = 1;
+        }
+
+        if (g_boff_consec > BOFF_CONSEC_THRESH)
+            cooldown = BOFF_COOLDOWN_MAX_MS;
+
+        if (now - last_recover_tick >= cooldown) {
+            CAN_ResetBus();
+            last_recover_tick = now;
+        }
+        ok_since = 0;
+    } else if (g_can_error.error_level == 0) {
+        uint32_t now = Delay_GetTick();
+        boff_counted = 0;            /* 退出 BusOff, 下次事件重新计数 */
+        if (ok_since == 0)
+            ok_since = now;
+        else if (now - ok_since > BOFF_STABLE_RESET_MS)
+            ok_since = 0;
+    } else {
+        boff_counted = 0;            /* error_level 1/2 也清标记 */
+        ok_since = 0;
+    }
+
 }
 
 /* ==================== Bus load calculation + throttle ==================== */

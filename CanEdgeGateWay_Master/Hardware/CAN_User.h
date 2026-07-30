@@ -19,6 +19,34 @@
 #include "../FreeRTOS/inc/semphr.h"
 #include "fifo.h"
 
+/* ================================================================
+ * RX Ring Buffer — ISR→Task 帧传递
+ *
+ * 单生产者(ISR) + 单消费者(Task)，无需互斥锁。
+ * 深度必须为 2 的幂，uint8_t 索引保证原子操作。
+ * 满判据: (head+1) & MASK == tail  → 留空一格区分空/满
+ * ================================================================ */
+#define RX_RING_DEPTH      32   /* 必须为 2 的幂 */
+#define RX_RING_MASK       (RX_RING_DEPTH - 1)
+
+typedef struct {
+    CanRxMsg         frames[RX_RING_DEPTH];
+    volatile uint8_t head;          /* ISR 写入 (生产者) */
+    volatile uint8_t tail;          /* Task 读取 (消费者) */
+    volatile uint16_t overflow_cnt; /* 非零 = 软件环形缓冲满，丢帧计数 */
+} RxRingBuf;
+
+/* Task 侧出队: 从环形缓冲读一帧 (不碰硬件 FIFO)。
+ * 返回 0=成功, 1=空。单消费者，无需锁。 */
+static inline uint8_t ring_pop(RxRingBuf *rb, CanRxMsg *msg)
+{
+    if (rb->tail == rb->head)
+        return 1;
+    *msg = rb->frames[rb->tail];
+    rb->tail = (uint8_t)((rb->tail + 1) & RX_RING_MASK);
+    return 0;
+}
+
 /* ---- CAN ID bases ---- */
 #define CAN_ID_EMERGENCY_BASE     0x100
 #define CAN_ID_NORMAL_BASE        0x200
@@ -29,7 +57,9 @@
 #define CAN_FUNC_TEMP_HUMI        0x02
 #define CAN_FUNC_ALARM            0x03
 #define CAN_FUNC_RECOVER          0x04
-#define CAN_FUNC_LIGHT            0x05   /* BH1750 light sensor */
+#define CAN_FUNC_LIGHT            0x05   /* BH1750 light sensor / LM393 AO */
+#define CAN_FUNC_LM393_DO         0x06   /* LM393 digital output (new) */
+#define CAN_FUNC_RESERVED         0x07   /* Reserved channel (new) */
 #define CAN_FUNC_BUSOFF_RECOVERY  0xF0   /* Bus-Off recovery notification */
 
 /* ---- Frame byte index ---- */
@@ -41,23 +71,28 @@
 
 /* ---- Node management ---- */
 #define MAX_SLAVE_NODES           8
-#define HEARTBEAT_TIMEOUT_MS      1500
-#define NODE_BLACKLIST_TIMEOUT_MS 10000
+#define STALE_TIMEOUT_MS          3000U   /* 3× 心跳周期, 数据过期 */
+#define OFFLINE_CONFIRM_MS        30000U  /* 持续 EXP 30s 判永久离线 */
 
 /* ---- Slave node record ---- */
 typedef struct {
     uint8_t  node_id;
-    uint8_t  online;
+    uint8_t  online;              /* 1=收到过帧 (CAN_ProcessFrame 置, 永远不清 0) */
+    uint8_t  stale;               /* 1=>3s 未收帧, 短期过期标记 */
+    uint8_t  offline;             /* 1=持续 EXP 超过 30s, 长期确认离线 */
     uint32_t last_heartbeat_tick;
+    uint32_t expire_start_tick;   /* 进入 EXP 瞬间打时间戳, 避免持续差值计算 */
     uint16_t heartbeat_count;
     uint8_t  fault_flag;
-    uint8_t  blacklist;
-    uint32_t blacklist_start_tick;
+    /* 无 blacklist / hb_lost / 防抖计数器 — 极简设计 */
     uint8_t  temp_int;
     uint8_t  temp_dec;
     uint8_t  humi_int;
     uint8_t  humi_dec;
-    uint16_t light_lux;         /* BH1750 lux (CAN_FUNC_LIGHT) */
+    uint16_t light_lux;         /* BH1750 lux / LM393 AO analog (CAN_FUNC_LIGHT) */
+    uint16_t lm393_analog;      /* LM393 AO raw ADC 0~4095 (same payload as light_lux) */
+    uint8_t  lm393_digital;     /* LM393 DO 0=Bright / 1=Dark */
+    uint16_t reserved_ch1;      /* Reserved channel value */
 } SlaveNode_t;
 
 /* ---- CAN error status ---- */
@@ -86,10 +121,14 @@ extern volatile uint32_t  g_can_rx_temp_count;
 extern volatile uint16_t  g_bus_off_recovery_cnt;
 extern volatile uint8_t   g_system_throttle_level;
 
-/* ---- FreeRTOS sync objects ---- */
-extern SemaphoreHandle_t  g_can_rx_sem;
-extern SemaphoreHandle_t  g_can_fifo_not_empty;
-extern SemaphoreHandle_t  g_can_monitor_sem;
+/* ---- RX Ring Buffers (ISR→Task, 锁无关 SPSC, 各 ISR 写各自的) ---- */
+extern RxRingBuf         g_rx_ring_high;
+extern RxRingBuf         g_rx_ring_norm;
+
+/* DBG: 调试步进计数 */
+extern volatile uint8_t  g_dbg_step;
+
+/* FIFO0 由 Task 轮询（ISR 禁用） */
 
 /* ---- CAN init ---- */
 void CAN_User_Init(void);
@@ -101,6 +140,7 @@ uint8_t CAN_SendFrame(uint32_t id, uint8_t *data, uint8_t len);
 
 /* ---- ISR handlers ---- */
 void CAN1_RX0_IRQHandler(void);
+void CAN1_RX1_IRQHandler(void);
 void CAN1_SCE_IRQHandler(void);
 
 /* ---- Frame processing (called from vTask_CAN_Rx) ---- */
