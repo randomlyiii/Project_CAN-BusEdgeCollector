@@ -32,11 +32,16 @@ static TaskHandle_t hTask_Housekeep = NULL;
 
 static char g_oled_line[4][17];
 static uint8_t g_eth_was_connected = 0;
+static volatile uint8_t g_fmp0_before = 0;  /* DBG: FMP0 drain 前快照 */
 
 /* ---- Page-switch key (PA0, GND=press) ---- */
 #define KEY_PAGE_PORT    GPIOA
 #define KEY_PAGE_PIN     GPIO_Pin_0
-static uint8_t g_display_page = 0;  /* 0=sensors+ETH, 1=CAN bus+alarm */
+static uint8_t  g_display_page = 0;
+static uint32_t g_last_page_switch_tick = 0;
+
+/* ---- Alarm jump detection ---- */
+static uint8_t g_prev_alarm_state = 0;
 
 static void KEY_Page_Init(void)
 {
@@ -61,19 +66,10 @@ static uint8_t KEY_Page_Scan(void)
 static const char *CAN_StateStr(void)
 {
     switch (g_can_error.error_level) {
+    case 0:  return "OK ";
     case 1:  return "WRN";
-    case 2:  return "ERR";
-    case 3:  return "BOF";
-    default:
-        /* 启动后 3 秒未收到任何帧 → 总线异常（CAN 线未接/从站掉电） */
-        if (g_can_rx_int_count == 0 && Delay_GetTick() > 3000)
-            return "WRN";
-        /* 已知节点曾在线但现在离线 → 总线异常 */
-        for (uint8_t i = 0; i < MAX_SLAVE_NODES; i++) {
-            if (g_slave_nodes[i].last_heartbeat_tick > 0 && !g_slave_nodes[i].online)
-                return "WRN";
-        }
-        return "OK ";
+    case 2:  return "EPS";
+    default: return "BOF";
     }
 }
 
@@ -85,98 +81,250 @@ static const char *ETH_StateStr(void)
     return "LSN ";
 }
 
-static void OLED_BuildPage1(void)
+/* ---- Node status helper for OLED (6 态: --- < ??? < ON < EXP < OFF < ALM) ---- */
+static const char *OLED_NodeStatusStr(uint8_t i)
 {
-    /* ---- Page 1: Sensor + ETH (original display) ---- */
-    uint8_t online1 = g_slave_nodes[0].online;
-    uint8_t fault1  = g_slave_nodes[0].fault_flag;
-
-    sprintf(g_oled_line[0], "CAN:%-3s ETH:%-4s", CAN_StateStr(), ETH_StateStr());
-    if (online1) {
-        uint16_t lux = g_slave_nodes[0].light_lux;
-        if (lux < 1000)
-            sprintf(g_oled_line[1], "S1:%d.%dC L:%3u",
-                    g_slave_nodes[0].temp_int, g_slave_nodes[0].temp_dec, lux);
-        else {
-            uint16_t k = lux / 1000;
-            uint8_t  d = (lux % 1000) / 100;
-            sprintf(g_oled_line[1], "S1:%d.%dC L:%u.%uk",
-                    g_slave_nodes[0].temp_int, g_slave_nodes[0].temp_dec, k, d);
-        }
-    } else
-        sprintf(g_oled_line[1], "S1:--.-C L:---");
-    sprintf(g_oled_line[2], "H:%d.%d%% HB:%-5u",
-            g_slave_nodes[0].humi_int, g_slave_nodes[0].humi_dec,
-            (g_slave_nodes[0].heartbeat_count > 99999) ? 99999UL : g_slave_nodes[0].heartbeat_count);
-    {
-        char r_str[5]; const char *status;
-        uint32_t rx = g_can_rx_int_count;
-        uint8_t hc = FIFO_High_Count(), nc = FIFO_Normal_Count();
-        if (rx >= 1000000)      sprintf(r_str, "%luM", rx/1000000);
-        else if (rx >= 10000)   sprintf(r_str, "%luK", rx/1000);
-        else if (rx >= 1000)    sprintf(r_str, "%lu.%luK", rx/1000, (rx%1000)/100);
-        else                    sprintf(r_str, "%lu", (unsigned long)rx);
-        if (!online1)                status = "OFF";
-        else if (fault1)             status = "ALM";
-        else if (g_slave_nodes[0].blacklist) status = "BLK";
-        else                         status = "OK ";
-        if (hc > 99) hc = 99; if (nc > 99) nc = 99;
-        sprintf(g_oled_line[3], "R%-4s %s %u/%u",
-                r_str, status, hc, nc);
-    }
+    if (g_slave_nodes[i].node_id == 0) return "???";
+    if (!g_slave_nodes[i].online)      return "---";  /* 预分配槽位, 从未收到帧 */
+    if (g_slave_nodes[i].fault_flag)   return "ALM";  /* 硬件告警 */
+    if (g_slave_nodes[i].offline)      return "OFF";  /* >30s 收不到帧 */
+    if (g_slave_nodes[i].stale)        return "EXP";  /* >3s 收不到帧 */
+    return "ON ";                                      /* 正常 */
 }
 
-static void OLED_BuildPage2(void)
+/* ---- RX count compact formatter (safe: max 4 chars) ---- */
+static const char *OLED_RxStr(char *buf)
 {
-    /* ---- Page 2: CAN bus status + Alarms ---- */
-    const char *state = CAN_StateStr();
-    uint16_t load = g_can_error.bus_load;
-    uint8_t  thr  = g_can_error.throttle_level;
-    uint8_t  alm  = 0, blk = 0;
+    uint32_t rx = g_can_rx_int_count;
+    if      (rx >= 1000000UL) sprintf(buf, "%luM", (unsigned long)(rx / 1000000UL));
+    else if (rx >= 10000UL)   sprintf(buf, "%luK", (unsigned long)(rx / 1000UL));
+    else if (rx >= 1000UL)    sprintf(buf, "%lu.%luK", (unsigned long)(rx / 1000UL), (unsigned long)((rx % 1000UL) / 100UL));
+    else                      sprintf(buf, "%lu",   (unsigned long)rx);
+    return buf;
+}
+
+/* Compact uint32 formatter: returns "999", "1.2K", "12K", "1.2M" (max 4 chars) */
+static const char *OLED_CompactNum(char *buf, uint32_t val)
+{
+    if      (val >= 1000000UL) sprintf(buf, "%luM", (unsigned long)(val / 1000000UL));
+    else if (val >= 10000UL)   sprintf(buf, "%luK", (unsigned long)(val / 1000UL));
+    else if (val >= 1000UL)    sprintf(buf, "%lu.%luK", (unsigned long)(val / 1000UL), (unsigned long)((val % 1000UL) / 100UL));
+    else                       sprintf(buf, "%lu",   (unsigned long)val);
+    return buf;
+}
+
+/* ================================================================
+ * Page 0 — 仪表盘 (Dashboard)   [all lines ≤16 chars verified]
+ *
+ * CAN:OK ETH:CON         ← CAN + ETH
+ * S1:ON  HB:12345        ← 节点1 状态 + 心跳
+ * S2:ON  HB:999          ← 节点2 状态 + 心跳
+ * ALM:N E:0 R:1.5K       ← 告警 + 过期节点 + 帧数
+ * ================================================================ */
+static void OLED_BuildPage0(void)
+{
+    char num_buf[8];
+    uint8_t alarm = 0;
+
+    uint8_t expired = 0;
+
     for (uint8_t i = 0; i < MAX_SLAVE_NODES; i++) {
         if (g_slave_nodes[i].node_id == 0) continue;
-        if (g_slave_nodes[i].fault_flag ||
-            (g_slave_nodes[i].last_heartbeat_tick > 0 && !g_slave_nodes[i].online))  alm = 1;
-        if (g_slave_nodes[i].blacklist)   blk++;
+        if (g_slave_nodes[i].fault_flag) alarm = 1;
+        if (g_slave_nodes[i].stale)      expired++;
     }
 
-    /* Line 1: CAN error level + bus load */
-    sprintf(g_oled_line[0], "CAN:%-3s L:%u.%02u%%",
-            state, load / 100, load % 100);
+    /* "CAN:BOF ETH:FAIL" = 16 chars */
+    sprintf(g_oled_line[0], "CAN:%-3s ETH:%-4s", CAN_StateStr(), ETH_StateStr());
 
-    /* Line 2: Alarm flag + throttle + recovery count */
-    sprintf(g_oled_line[1], "ALM:%c THR:%u RC:%u",
-            alm ? 'Y' : 'N', thr,
-            (unsigned int)g_bus_off_recovery_cnt);
+    /* "S1:ON  HB:65535" = 16 chars (hb clamped to 99999) */
+    sprintf(g_oled_line[1], "S1:%-3s HB:%-5u",
+            OLED_NodeStatusStr(0),
+            (unsigned int)(g_slave_nodes[0].heartbeat_count > 99999U ? 99999U : g_slave_nodes[0].heartbeat_count));
 
-    /* Line 3: FIFO pending + blacklist */
-    {
-        uint8_t hc = FIFO_High_Count(), nc = FIFO_Normal_Count();
-        if (hc > 99) hc = 99;
-        if (nc > 99) nc = 99;
-        sprintf(g_oled_line[2], "H:%u N:%u BLK:%u",
-                hc, nc, blk);
-    }
+    sprintf(g_oled_line[2], "S2:%-3s HB:%-5u",
+            OLED_NodeStatusStr(1),
+            (unsigned int)(g_slave_nodes[1].heartbeat_count > 99999U ? 99999U : g_slave_nodes[1].heartbeat_count));
 
-    /* Line 4: RX count + FIFO overflow */
-    {
-        char rx_str[7];
-        uint32_t rx = g_can_rx_int_count;
-        if (rx >= 1000000)      sprintf(rx_str, "%luM", rx/1000000);
-        else if (rx >= 10000)   sprintf(rx_str, "%luK", rx/1000);
-        else if (rx >= 1000)    sprintf(rx_str, "%lu.%luK", rx/1000, (rx%1000)/100);
-        else                    sprintf(rx_str, "%lu", (unsigned long)rx);
-        sprintf(g_oled_line[3], "RX:%-5s OV:%u",
-                rx_str, (unsigned int)g_fifo_high_overflow_cnt);
-    }
+    /* "ALM:N E:0 R:999K" = 16 chars (E=expired nodes count) */
+    sprintf(g_oled_line[3], "ALM:%c E:%u R:%s",
+            alarm ? 'Y' : 'N',
+            (unsigned int)expired,
+            OLED_RxStr(num_buf));
 }
 
+/* ================================================================
+ * Page 1 — 节点1 详细 (Node#01: DHT11 + BH1750)
+ *
+ * S1 Node#01             ← 12 chars
+ * T:50.9C H:90.9%        ← max 16 chars (DHT11 spec limit)
+ * L:65.5k HB:65535       ← max 16 chars
+ * ALM:N RC:99            ← 12 chars
+ * ================================================================ */
+static void OLED_BuildPage1(void)
+{
+    uint8_t online = g_slave_nodes[0].online;
+    /* Clamp sensor values within display-safe range */
+    uint8_t ti = g_slave_nodes[0].temp_int;
+    uint8_t td = g_slave_nodes[0].temp_dec;
+    uint8_t hi = g_slave_nodes[0].humi_int;
+    uint8_t hd = g_slave_nodes[0].humi_dec;
+    if (ti > 99U) ti = 99U;  if (td > 9U) td = 9U;
+    if (hi > 99U) hi = 99U;  if (hd > 9U) hd = 9U;
+
+    sprintf(g_oled_line[0], "S1 Node#01");
+
+    /* "T:99.9C H:99.9%" = 16 chars exactly */
+    sprintf(g_oled_line[1], "T:%u.%uC H:%u.%u%%",
+            (unsigned int)ti, (unsigned int)td,
+            (unsigned int)hi, (unsigned int)hd);
+
+    if (online) {
+        uint16_t lux = g_slave_nodes[0].light_lux;
+        uint16_t hb  = g_slave_nodes[0].heartbeat_count;
+        if (hb > 65535U) hb = 65535U;
+        if (lux >= 1000U) {
+            uint16_t k = lux / 1000U;
+            uint8_t  d = (lux % 1000U) / 100U;
+            if (k > 99U) { k = 99U; d = 9U; }
+            /* "L:99.9k HB:65535" = 16 chars */
+            sprintf(g_oled_line[2], "L:%u.%uk HB:%u",
+                    (unsigned int)k, (unsigned int)d, (unsigned int)hb);
+        } else {
+            /* "L:999 HB:65535" = 15 chars */
+            sprintf(g_oled_line[2], "L:%u HB:%u",
+                    (unsigned int)lux, (unsigned int)hb);
+        }
+    } else {
+        sprintf(g_oled_line[2], "L:--- HB:----");
+    }
+    /* RC capped at 99: "ALM:N RC:99" = 12 chars */
+    sprintf(g_oled_line[3], "ALM:%c RC:%u",
+            g_slave_nodes[0].fault_flag ? 'Y' : 'N',
+            (unsigned int)(g_bus_off_recovery_cnt > 99U ? 99U : g_bus_off_recovery_cnt));
+}
+
+/* ================================================================
+ * Page 2 — 节点2 详细 (Node#02: LM393 + RESERVED)
+ *
+ * S2 Node#02             ← 12 chars
+ * LM:BR A:4095           ← 12 chars
+ * CH1:---- HB:999        ← 15 chars
+ * ALM:N RC:99            ← 12 chars
+ * ================================================================ */
+static void OLED_BuildPage2(void)
+{
+    uint16_t hb = g_slave_nodes[1].heartbeat_count;
+    uint16_t ao = g_slave_nodes[1].lm393_analog;
+    if (hb > 999U)  hb = 999U;
+    if (ao > 9999U) ao = 9999U;
+    const char *dig = g_slave_nodes[1].lm393_digital ? "DK" : "BR";
+
+    sprintf(g_oled_line[0], "S2 Node#02");
+    /* "LM:BR A:4095" = 12 chars (pad loop fills to 16) */
+    sprintf(g_oled_line[1], "LM:%s A:%-4u",
+            dig, (unsigned int)ao);
+
+    sprintf(g_oled_line[2], "CH1:---- HB:%u",
+            (unsigned int)hb);
+
+    sprintf(g_oled_line[3], "ALM:%c RC:%u",
+            g_slave_nodes[1].fault_flag ? 'Y' : 'N',
+            (unsigned int)(g_bus_off_recovery_cnt > 99U ? 99U : g_bus_off_recovery_cnt));
+}
+
+/* ================================================================
+ * Page 3 — 总线诊断 (Bus Diagnostics)
+ *
+ * L:100.00% THR:2        ← max 15 chars (load=10000, thr=2)
+ * H:99 N:99 OV:99K       ← max 16 chars (OV compact-formatted)
+ * ERR:BOF RC:99K E:8     ← max 16 chars (RC compact-formatted)
+ * RX:999K FIFO:OK        ← max 16 chars
+ * ================================================================ */
+static void OLED_BuildPage3(void)
+{
+    char nb1[8], nb2[8], nb3[8];
+    uint16_t load   = g_can_error.bus_load;
+    uint8_t  thr    = g_can_error.throttle_level;
+    uint8_t  hc     = FIFO_High_Count();
+    uint8_t  nc     = FIFO_Normal_Count();
+    uint16_t ov_cnt = (uint16_t)g_fifo_high_overflow_cnt;
+    uint16_t rc_cnt = (uint16_t)g_bus_off_recovery_cnt;
+    uint8_t  expired = 0;
+    const char *err_lvl;
+
+    if (hc > 99U) hc = 99U;
+    if (nc > 99U) nc = 99U;
+    for (uint8_t i = 0; i < MAX_SLAVE_NODES; i++) {
+        if (g_slave_nodes[i].node_id == 0) continue;
+        if (g_slave_nodes[i].stale) expired++;
+    }
+    switch (g_can_error.error_level) {
+    case 0:  err_lvl = "OK "; break;
+    case 1:  err_lvl = "WRN"; break;
+    case 2:  err_lvl = "EPS"; break;
+    default: err_lvl = "BOF"; break;
+    }
+
+    /* "L:100.00% THR:2" = 15 chars */
+    sprintf(g_oled_line[0], "L:%u.%02u%% THR:%u",
+            (unsigned int)(load / 100U), (unsigned int)(load % 100U),
+            (unsigned int)thr);
+
+    /* "H:99 N:99 O:65K" = 15 chars (O=overflow, compact format) */
+    sprintf(g_oled_line[1], "H:%u N:%u O:%s",
+            (unsigned int)hc, (unsigned int)nc,
+            OLED_CompactNum(nb1, ov_cnt));
+
+    /* "E:BOF R:65K E:8" = 16 chars (E=error, R=recovery, E=expired) */
+    sprintf(g_oled_line[2], "E:%s R:%s E:%u",
+            err_lvl, OLED_CompactNum(nb2, rc_cnt),
+            (unsigned int)expired);
+
+    /* "RX:65.5K F:OK" = 11 chars (F=FIFO status) */
+    sprintf(g_oled_line[3], "RX:%s F:%s",
+            OLED_RxStr(nb3),
+            ov_cnt > 0U ? "OV" : "OK");
+}
+
+/**
+ * OLED Update — page dispatch with auto-return and alarm jump
+ **/
 static void OLED_UpdateDisplay(void)
 {
-    if (g_display_page == 0)
-        OLED_BuildPage1();
-    else
-        OLED_BuildPage2();
+    uint32_t now = Delay_GetTick();
+
+    /* Auto-return to page 0 after inactivity.
+     * 超时来自 g_regs[REG_OLED_AUTO_RETURN_MS] (可从 ModbusPoll 写入 0x002C 动态调节).
+     * 0=永不自动回主页. 出厂默认 10000ms (ModbusTCP_Init 写入). */
+    if (g_display_page != 0) {
+        uint32_t t = g_regs[REG_OLED_AUTO_RETURN_MS];
+        if (t && now - g_last_page_switch_tick > t) {
+            g_display_page = 0;
+            OLED_Clear();
+        }
+    }
+
+    /* Alarm jump: new alarm → force page 0 */
+    {
+        uint8_t cur_alarm = 0;
+        for (uint8_t i = 0; i < MAX_SLAVE_NODES; i++) {
+            if (g_slave_nodes[i].fault_flag) { cur_alarm = 1; break; }
+        }
+        if (cur_alarm && !g_prev_alarm_state && g_display_page != 0) {
+            g_display_page = 0;
+            OLED_Clear();
+        }
+        g_prev_alarm_state = cur_alarm;
+    }
+
+    /* Build selected page */
+    switch (g_display_page) {
+    case 1: OLED_BuildPage1(); break;
+    case 2: OLED_BuildPage2(); break;
+    case 3: OLED_BuildPage3(); break;
+    default: OLED_BuildPage0(); break;
+    }
 
     /* Pad to 16 chars to clear stale pixels, then draw */
     for (uint8_t i = 0; i < 4; i++) {
@@ -187,42 +335,104 @@ static void OLED_UpdateDisplay(void)
     }
 }
 
-/* ========= 统一任务: 顺序处理 CAN + W5500 (Phase 1 架构) ========= */
+/* ========= 统一任务: 顺序处理 CAN + W5500 (Phase 1 架构) =========
+ *
+ * CAN RX: ISR 将帧从硬件 FIFO 搬到软件环形缓冲 (ring_push),
+ *         任务在此 drain 软件缓冲 (ring_pop)，不碰硬件 FIFO。
+ *         紧急帧 (g_rx_ring_high) 优先处理。
+ *
+ * CAN TX: 非阻塞，发前检查空闲邮箱，无邮箱则留到下一周期。
+ * ================================================================ */
 
 static void Task_Unified(void *pvParameters)
 {
     (void)pvParameters;
     TickType_t xLastWake;
+    CanRxMsg   rx_msg;
 
     CAN_DeInit(CAN1); Delay_ms(10); CAN_User_Init();
+    CAN_EnableInterrupts();     /* re-enable after DeInit killed them */
     vTaskDelay(pdMS_TO_TICKS(100));
     W5500_TCPServer_Start(MODBUS_PORT);
     xLastWake = xTaskGetTickCount();
 
     for (;;) {
-        /* 1. CAN Rx (紧轮询) */
-        CanRxMsg msg;
-        while (CAN_MessagePending(CAN1, CAN_FIFO0) > 0) {
-            CAN_Receive(CAN1, CAN_FIFO0, &msg);
-            g_isr_rx_frame.StdId = msg.StdId;
-            g_isr_rx_frame.IDE   = msg.IDE;
-            g_isr_rx_frame.RTR   = msg.RTR;
-            g_isr_rx_frame.DLC   = msg.DLC;
-            g_isr_rx_frame.FMI   = msg.FMI;
-            memcpy(g_isr_rx_frame.Data, msg.Data, 8);
+        IWDG_ReloadCounter();   /* 双保险喂狗 — 主循环也喂，防止 Housekeep 被饿死 */
+        GPIO_SetBits(GPIOA, GPIO_Pin_1);        /* DBG: 高电平 = 循环开始 */
+
+        /* ================================================================
+         * 1. CAN Rx — 从 ISR 已填好的环形缓冲 drain
+         * ================================================================ */
+        GPIO_ResetBits(GPIOA, GPIO_Pin_1);      /* DBG: 低 = CAN_RX */
+        g_dbg_step = 1;
+        /* Drain emergency ring (FIFO0 → 0x100-0x1FF) */
+        while (ring_pop(&g_rx_ring_high, &rx_msg) == 0) {
+            g_isr_rx_frame.StdId = rx_msg.StdId;
+            g_isr_rx_frame.IDE   = rx_msg.IDE;
+            g_isr_rx_frame.RTR   = rx_msg.RTR;
+            g_isr_rx_frame.DLC   = rx_msg.DLC;
+            g_isr_rx_frame.FMI   = rx_msg.FMI;
+            memcpy(g_isr_rx_frame.Data, rx_msg.Data, 8);
             CAN_ProcessFrame(&g_isr_rx_frame);
         }
-        /* 2. CAN Tx (FIFO 中待发帧) */
-        CanRxFrame frame;
-        while (FIFO_High_Pop(&frame) == 0)
-            CAN_SendFrame(frame.StdId, frame.Data, frame.DLC);
-        while (FIFO_Normal_Pop(&frame) == 0)
-            CAN_SendFrame(frame.StdId, frame.Data, frame.DLC);
+        g_fmp0_before = (uint8_t)(CAN1->RF0R & 0x03); /* 快照: drain 前 FMP0 */
+
+        /* FIFO0 轮询 */
+        {   CanRxMsg rx2;
+            while (CAN_MessagePending(CAN1, CAN_FIFO0) > 0) {
+                CAN_Receive(CAN1, CAN_FIFO0, &rx2);
+                g_isr_rx_frame.StdId = rx2.StdId;
+                g_isr_rx_frame.IDE   = rx2.IDE;
+                g_isr_rx_frame.RTR   = rx2.RTR;
+                g_isr_rx_frame.DLC   = rx2.DLC;
+                g_isr_rx_frame.FMI   = rx2.FMI;
+                memcpy(g_isr_rx_frame.Data, rx2.Data, 8);
+                CAN_ProcessFrame(&g_isr_rx_frame);
+            }
+        }
+        /* DBG: FIFO1 直接轮询 Fallback (ISR 可能没触发) */
+        {   CanRxMsg rx3;
+            while (CAN_MessagePending(CAN1, CAN_FIFO1) > 0) {
+                CAN_Receive(CAN1, CAN_FIFO1, &rx3);
+                g_isr_rx_frame.StdId = rx3.StdId;
+                g_isr_rx_frame.IDE   = rx3.IDE;
+                g_isr_rx_frame.RTR   = rx3.RTR;
+                g_isr_rx_frame.DLC   = rx3.DLC;
+                g_isr_rx_frame.FMI   = rx3.FMI;
+                memcpy(g_isr_rx_frame.Data, rx3.Data, 8);
+                CAN_ProcessFrame(&g_isr_rx_frame);
+            }
+        }
+
+        g_dbg_step = 2;
+        /* Drain normal ring (FIFO1 → 0x200-0x3FF) */
+        while (ring_pop(&g_rx_ring_norm, &rx_msg) == 0) {
+            g_isr_rx_frame.StdId = rx_msg.StdId;
+            g_isr_rx_frame.IDE   = rx_msg.IDE;
+            g_isr_rx_frame.RTR   = rx_msg.RTR;
+            g_isr_rx_frame.DLC   = rx_msg.DLC;
+            g_isr_rx_frame.FMI   = rx_msg.FMI;
+            memcpy(g_isr_rx_frame.Data, rx_msg.Data, 8);
+            CAN_ProcessFrame(&g_isr_rx_frame);
+        }
+
+        g_dbg_step = 3;
+        /* 2. CAN Tx — 主站只接收, 不主动发帧.
+         *    从站心跳/数据由 CAN 控制器硬件自动应答, 不需主站主动参与.
+         *    去掉测试帧: 避免无 ACK 时自动重传推 TEC 至 BusOff. */
+        /* (CAN Tx intentionally omitted — master is receive-only) */
+
+        g_dbg_step = 4;
         /* 3. CAN 监控 */
-        CAN_HeartBeatCheck(); CAN_ErrorMonitor(); CAN_CalcBusLoad();
+        CAN_ErrorMonitor(); CAN_HeartBeatCheck(); CAN_CalcBusLoad();
         CAN_CheckEscalation(); CAN_CheckDeescalation();
-        /* 4. W5500 + ModbusTCP (顺序在 CAN 之后, 不并发) */
+
+        g_dbg_step = 5;
+        /* 4. W5500 + ModbusTCP */
+        GPIO_SetBits(GPIOA, GPIO_Pin_1);        /* DBG: 高 = W5500 开始 */
         W5500_TCPServer_Run();
+        GPIO_ResetBits(GPIOA, GPIO_Pin_1);       /* DBG: 低 = W5500 结束 */
+        g_dbg_step = 6;
         ModbusTCP_Process();
         ModbusTCP_SyncFromCAN();
         if (W5500_IsConnected()) {
@@ -230,11 +440,15 @@ static void Task_Unified(void *pvParameters)
         } else {
             if (g_eth_was_connected) { ModbusTCP_OnDisconnect(); g_eth_was_connected = 0; }
         }
-        /* 5. Key scan (page toggle) */
+
+        /* 5. Key scan (4-page cycle, 10s auto-return) */
         if (KEY_Page_Scan()) {
-            g_display_page = !g_display_page;
+            g_display_page = (g_display_page + 1) % 4;
+            g_last_page_switch_tick = Delay_GetTick();
             OLED_Clear();
         }
+
+        IWDG_ReloadCounter();                   /* 喂狗紧贴 vTaskDelayUntil */
         vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(10));
     }
 }
@@ -285,12 +499,41 @@ void vApplicationMallocFailedHook(void)
 
 /* ==================== Main ==================== */
 
+/* ---- 复位原因检测 ---- */
+static const char *ResetCauseStr(void)
+{
+    uint32_t csr = RCC->CSR;
+    RCC->CSR |= RCC_CSR_RMVF;                  /* 清除标志 */
+    if (csr & RCC_CSR_IWDGRSTF) return "IWDG"; /* 看门狗超时 */
+    if (csr & RCC_CSR_SFTRSTF)  return "SW";   /* 软件复位 */
+    if (csr & RCC_CSR_PORRSTF)  return "POR";  /* 上电复位 */
+    if (csr & RCC_CSR_PINRSTF)  return "NRST"; /* 外部复位 */
+    return "UNKN";
+}
+
 int main(void)
 {
     int8_t ret;
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_4);
     Delay_InitTick(); Delay_ms(200);
     OLED_Init(); OLED_Clear();
+
+    /* DBG: PA1 输出 — 万用表量电压定位卡死点 */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    {   GPIO_InitTypeDef g;
+        g.GPIO_Pin = GPIO_Pin_1; g.GPIO_Mode = GPIO_Mode_Out_PP;
+        g.GPIO_Speed = GPIO_Speed_50MHz;
+        GPIO_Init(GPIOA, &g);
+    }
+
+    /* 显示上次复位原因 */
+    {   char dbg[17];
+        sprintf(dbg, "RST:%s", ResetCauseStr());
+        OLED_ShowString(1, 1, dbg);
+        Delay_ms(1500);
+    }
+
+    OLED_Clear();
     OLED_ShowString(1, 1, "M: Init...");
     KEY_Page_Init();
 

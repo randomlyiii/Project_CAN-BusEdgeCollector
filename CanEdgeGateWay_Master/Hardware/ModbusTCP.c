@@ -10,7 +10,7 @@
 #include <string.h>
 
 /* ---- Register array ---- */
-static uint16_t g_regs[MODBUS_REG_COUNT];
+uint16_t g_regs[MODBUS_REG_COUNT];
 static uint8_t  g_resp_buf[260];
 static uint8_t  g_work_buf[512];
 
@@ -33,17 +33,42 @@ static uint16_t HandleWriteReg(uint8_t *req, uint16_t req_len, uint8_t *resp);
 void ModbusTCP_Init(void)
 {
     memset(g_regs, 0, sizeof(g_regs));
+    g_regs[REG_OLED_AUTO_RETURN_MS] = 10000;   /* OLED 自动回主页超时 (ms) */
     memset(&g_cache, 0, sizeof(g_cache));
     g_modbus_rx_errs = 0;
     g_modbus_offline = 1;
     g_cache.was_disconnected = 0;
 }
 
-/* ==================== Sync from CAN (called at 50ms period) ==================== */
+/* ---- CAN DATA byte indices (local copy for FIFO drain) ---- */
+#define MODB_CAN_DATA_TYPE_IDX    0
+#define MODB_CAN_DATA_SRC_IDX     1
+#define MODB_CAN_DATA_FUNC_IDX    2
+#define MODB_CAN_DATA_PAYLOAD_IDX 3
+
+/* ==================== Internal: push to history cache ==================== */
+
+static uint8_t Cache_Push(uint16_t addr, uint16_t value, uint32_t timestamp, uint8_t priority)
+{
+    if (g_cache.hist_count >= HIST_CACHE_MAX) {
+        g_cache.hist_tail = (g_cache.hist_tail + 1) % HIST_CACHE_MAX;
+        g_cache.hist_count--;
+    }
+    g_cache.history[g_cache.hist_head].addr      = addr;
+    g_cache.history[g_cache.hist_head].value     = value;
+    g_cache.history[g_cache.hist_head].timestamp = timestamp;
+    g_cache.history[g_cache.hist_head].priority  = priority;
+    g_cache.hist_head  = (g_cache.hist_head + 1) % HIST_CACHE_MAX;
+    g_cache.hist_count++;
+    return 0;
+}
+
+/* ==================== Sync from CAN + drain FIFO to history ==================== */
 
 void ModbusTCP_SyncFromCAN(void)
 {
     uint8_t i;
+    CanRxFrame f;
 
     /* Slave 1 */
     if (g_slave_nodes[0].node_id != 0) {
@@ -61,9 +86,11 @@ void ModbusTCP_SyncFromCAN(void)
                                     + g_slave_nodes[1].temp_dec;
         g_regs[REG_SLAVE2_HUMI]   = (uint16_t)g_slave_nodes[1].humi_int * 10
                                     + g_slave_nodes[1].humi_dec;
-        g_regs[REG_SLAVE2_HB_CNT] = g_slave_nodes[1].heartbeat_count;
-        g_regs[REG_SLAVE2_FAULT]  = g_slave_nodes[1].fault_flag;
-        g_regs[REG_SLAVE2_ONLINE] = g_slave_nodes[1].online;
+        g_regs[REG_SLAVE2_HB_CNT]  = g_slave_nodes[1].heartbeat_count;
+        g_regs[REG_SLAVE2_FAULT]   = g_slave_nodes[1].fault_flag;
+        g_regs[REG_SLAVE2_ONLINE]  = g_slave_nodes[1].online;
+        g_regs[REG_SLAVE2_LM393_AO] = g_slave_nodes[1].lm393_analog;
+        g_regs[REG_SLAVE2_LM393_DO] = g_slave_nodes[1].lm393_digital;
     }
 
     /* CAN diagnostics */
@@ -99,6 +126,28 @@ void ModbusTCP_SyncFromCAN(void)
     for (i = 0; i < MAX_SLAVE_NODES; i++) {
         if (g_slave_nodes[i].online)
             g_regs[REG_ONLINE_NODE_MASK] |= (1 << (g_slave_nodes[i].node_id - 1));
+    }
+
+    /* ---- Drain FIFO → 历史缓存 ---- */
+    {
+        uint32_t tnow = Delay_GetTick();
+        while (FIFO_High_Pop(&f) == 0) {
+            Cache_Push(
+                ((uint16_t)f.Data[MODB_CAN_DATA_SRC_IDX] << 8)
+                    | f.Data[MODB_CAN_DATA_FUNC_IDX],
+                ((uint16_t)f.Data[MODB_CAN_DATA_PAYLOAD_IDX] << 8)
+                    | f.Data[MODB_CAN_DATA_PAYLOAD_IDX + 1],
+                tnow, 0);
+        }
+        while (FIFO_Normal_Pop(&f) == 0) {
+            uint8_t p = (f.Data[MODB_CAN_DATA_TYPE_IDX] == 2) ? 2 : 1;
+            Cache_Push(
+                ((uint16_t)f.Data[MODB_CAN_DATA_SRC_IDX] << 8)
+                    | f.Data[MODB_CAN_DATA_FUNC_IDX],
+                ((uint16_t)f.Data[MODB_CAN_DATA_PAYLOAD_IDX] << 8)
+                    | f.Data[MODB_CAN_DATA_PAYLOAD_IDX + 1],
+                tnow, p);
+        }
     }
 }
 
@@ -199,7 +248,9 @@ static uint16_t HandleWriteReg(uint8_t *req, uint16_t req_len, uint8_t *resp)
     if (addr == REG_CTRL_RESET && val == 0x55) {
         CAN_ResetBus();
     } else if (addr == REG_CTRL_UNBLACKLIST && val > 0 && val <= MAX_SLAVE_NODES) {
-        g_slave_nodes[val - 1].blacklist = 0;
+        g_slave_nodes[val - 1].stale = 0;
+        g_slave_nodes[val - 1].offline = 0;
+        g_slave_nodes[val - 1].expire_start_tick = 0;
         g_slave_nodes[val - 1].online = 1;
         CAN_ManualDeescalate(val);
     } else if (addr >= 0x0020) {

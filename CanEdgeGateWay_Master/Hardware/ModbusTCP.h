@@ -25,12 +25,14 @@
 #define REG_SLAVE1_FAULT         0x0003
 #define REG_SLAVE1_ONLINE        0x0004
 
-/* Slave 2 data (0x05–0x09) */
+/* Slave 2 data (0x05–0x0B) */
 #define REG_SLAVE2_TEMP          0x0005
 #define REG_SLAVE2_HUMI          0x0006
 #define REG_SLAVE2_HB_CNT        0x0007
 #define REG_SLAVE2_FAULT         0x0008
 #define REG_SLAVE2_ONLINE        0x0009
+#define REG_SLAVE2_LM393_AO      0x000A   /* LM393 analog 0~4095 */
+#define REG_SLAVE2_LM393_DO      0x000B   /* LM393 digital 0/1 */
 
 /* CAN diagnostics (0x10–0x15) */
 #define REG_CAN_BUS_LOAD         0x0010
@@ -55,6 +57,7 @@
 #define REG_SYS_UPTIME_HIGH      0x0029   /* Uptime seconds, high word */
 #define REG_SYS_UPTIME_LOW       0x002A   /* Uptime seconds, low word */
 #define REG_THROTTLE_LEVEL       0x002B   /* 0=normal, 1=low-freq, 2=emergency */
+#define REG_OLED_AUTO_RETURN_MS  0x002C   /* OLED 自动回主页超时 ms, 0=永不 */
 
 #define MODBUS_REG_COUNT         0x0030
 
@@ -106,6 +109,7 @@ typedef struct {
 /* ---- Globals ---- */
 extern volatile uint16_t g_modbus_rx_errs;
 extern volatile uint8_t  g_modbus_offline;
+extern uint16_t g_regs[MODBUS_REG_COUNT];
 
 /* ---- API ---- */
 void     ModbusTCP_Init(void);
