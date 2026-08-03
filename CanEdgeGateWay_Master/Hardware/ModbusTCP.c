@@ -33,7 +33,7 @@ static uint16_t HandleWriteReg(uint8_t *req, uint16_t req_len, uint8_t *resp);
 void ModbusTCP_Init(void)
 {
     memset(g_regs, 0, sizeof(g_regs));
-    g_regs[REG_OLED_AUTO_RETURN_MS] = 10000;   /* OLED 自动回主页超时 (ms) */
+    g_regs[REG_OLED_AUTO_RETURN_MS] = 0;   /* OLED 自动回主页超时 (ms) */
     memset(&g_cache, 0, sizeof(g_cache));
     g_modbus_rx_errs = 0;
     g_modbus_offline = 1;
