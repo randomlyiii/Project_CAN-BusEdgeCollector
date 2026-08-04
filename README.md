@@ -68,22 +68,28 @@
 
 ### 主站
 
-单任务顺序架构（`Task_Unified`, prio 1, 10ms 周期），已验证多任务并发导致 SPI 时钟耦合 CAN RX 引脚产生不可恢复位错误：
+三任务解耦架构。CAN 帧处理独立成高优先级任务，避免 W5500 阻塞（实测 100~700ms）饿死 CAN ring：
 
 ```
-Task_Unified:
-  1. CAN Rx:  FIFO0 轮询
-     → DLC 校验 (≠8 丢弃) → Checksum 异或校验
-     → CAN_ProcessFrame (节点匹配 → 时间戳刷新)
-  2. CAN 监控: ErrorMonitor → HeartBeatCheck → CalcBusLoad
-  3. W5500:   TCP Server Run → Modbus Process → SyncFromCAN
-  4. 按键翻页 + IWDG 喂狗
+Task_CAN_Drain (prio 3, 10ms):   ← CAN RX 主路径
+  drain ring_high (FMP0 ISR 填充, 64 深紧凑帧 12B) → CAN_ProcessFrame
+  (g_can_ready 门闸: 初始化完成前只清 ring 不处理)
+
+Task_Unified (prio 1, 10ms):
+  1. CAN 监控: ErrorMonitor → HeartBeatCheck → CalcBusLoad
+  2. W5500:   TCP Server Run → Modbus Process → SyncFromCAN
+  3. 按键翻页 + IWDG 喂狗
 
 Task_Housekeep (prio 0, 1s): OLED 刷新 + 栈水位监控
 ```
 
+接收链: 硬件 FIFO0 → FMP0 中断 ISR (`USB_LP_CAN1_RX0_IRQHandler`) → 紧凑帧 ring
+(12B×64, 锁无关 SPSC) → Task_CAN_Drain → CAN_ProcessFrame (DLC + checksum 校验)。
+任务只读内存 ring，不碰硬件 FIFO/SPI → 不违反顺序约束。
+
 关键约束：
 - SPI（W5500）与 CAN 共用 GPIOA，不可并发（详见 `phase_md` 问题三）
+- Task_CAN_Drain 只读内存 ring，不产生 SPI 边沿，物理上与顺序架构等价
 - 主站 **receive-only**，不发帧（无 ACK 时硬件重传推 TEC→BusOff）
 - NART=ENABLE（从站），防单节点故障拖累全网
 
@@ -115,7 +121,8 @@ Task_Housekeep (prio 0, 1s): OLED 刷新 + 栈水位监控
 | CAN 0/1/2 级优先级分组 | 双方 | ✅ 完成 | 0x100/0x200/0x300 ID 分段 |
 | 升降级机制 | 主站 | 🟡 框架完成 | 主站 receive-only 期间不生效 |
 | 双 FIFO 缓冲（16+64 深）| 主站 | ✅ 完成 | 紧急/常态分级 + 溢出保护 + 历史缓存消费 |
-| 总线负载管控 | 主站 | ✅ 完成 | 100ms 窗口，三档节流（70%/90%）|
+| 总线负载管控 | 主站 | ✅ 完成 | 100ms 窗口，三档节流（70%/90%），折算位 122 |
+| CAN RX 高吞吐 | 主站 | ✅ 完成 | FMP0 ISR + ring64 紧凑帧 + 独立 drain 任务，5000fps 零丢帧（旧轮询 300fps 上限）|
 | 心跳检测 + BusOff 保护 | 主站 | ✅ 完成 | stale/offline 两段标记，error_level≥2 跳过 |
 | CAN 错误状态机 | 双方 | ✅ 完成 | 主站 INRQ 协议恢复 + 从站 ABOM 自愈 |
 | OLED 自动回主页超时可调 | 主站 | ✅ 完成 | Modbus 0x002C 动态设置或 #define 编译改 |
@@ -144,6 +151,9 @@ Task_Housekeep (prio 0, 1s): OLED 刷新 + 栈水位监控
 11. **checksum 校验必须与 DLC 校验配合** — DLC 保证长度合规，checksum 保证数据完整。缺任一都可能被干扰帧污染节点时间戳
 12. **告警帧收发均限流** — 从站发送 1 次/秒（连续告警降 2s），主站接收 200ms/节点。防止单从站故障引起的总线告警风暴
 13. **中断或轮询，二选一** — 不可混合使用。ISR 和 Task 同时读同一硬件 FIFO 必然产生竞态，导致帧丢失
+14. **RX0 ISR 向量名是 `USB_LP_CAN1_RX0_IRQHandler`** — F103 md 启动文件如此映射。写成 `CAN1_RX0_IRQHandler` 会被 linker 当未用符号删除，向量指向 weak 死循环 → 首帧卡死
+15. **CAN 帧处理必须独立任务** — W5500 SocketCmd/SendData 阻塞 100~700ms，同任务内 ring drain 会被饿死丢帧；独立 prio 3 任务每 10ms 抢占 drain
+16. **负载折算用真实帧长 122 位** — 原 108 位（无填充最小值）低估真实总线占用，5000fps 压测显示 88.56% 实为总线已满
 
 ---
 

@@ -1,7 +1,7 @@
 # CAN 通信规范 — CAN Bus Edge Collector
 
 > 适用范围: 主站 + 从站 CAN 通信层  
-> 最后更新: 2026-07-30 (第九次修改: 启用 FIFO_Push + 主站 receive-only 安全恢复双 FIFO 消费)
+> 最后更新: 2026-08-04 (第十次修改: FMP0 ISR + 紧凑 ring64 + 独立 drain 任务; 负载折算 108→122)
 
 ---
 
@@ -68,82 +68,100 @@
 
 ## 3. 主站 CAN 架构
 
-### 3.1 统一顺序任务（Task_Unified，优先级 1）
+### 3.1 任务架构（三任务解耦）
 
 ```
-Task_Unified (10ms 固定周期, vTaskDelayUntil):
-  1. CAN Rx:
-     ┌─ FIFO0: Task 轮询 (所有帧走 FIFO0, 全通滤波器)
-     │   (FMP0 中断禁用 — ISR 干扰调度, 已验证)
-     │
-     └─ FIFO1: ISR 推环形缓冲 → Task drain 环形缓冲
-         (CAN1_RX1_IRQHandler 仅 ring_push，不做业务解析)
-  
-  2. CAN Tx: 主站只接收，不主动发帧。
-     (0x7FF 测试帧已移除 — 无 ACK 时硬件自动重传推 TEC→255 BusOff)
-     从站心跳由 CAN 控制器硬件自动应答，无需主站参与。
+Task_CAN_Drain (prio 3, 10ms 固定周期):      ← CAN 帧处理独立任务
+  1. drain ring_high (FMP0 ISR 填充, 64 深紧凑帧) → CAN_ProcessFrame
+  2. drain ring_norm (FIFO1 fallback, 4 深)
+  (g_can_ready 门闸: CAN/FIFO 初始化完成前只清 ring 不处理)
 
-  3. CAN 监控: HeartBeatCheck / ErrorMonitor / CalcBusLoad / CheckEscalation / CheckDeescalation
-  
-  4. W5500 + ModbusTCP (顺序执行，不与 CAN 并发)
+Task_Unified (prio 1, 10ms 固定周期):
+  1. CAN 监控: HeartBeatCheck / ErrorMonitor / CalcBusLoad / CheckEscalation / CheckDeescalation
+  2. W5500 + ModbusTCP (顺序执行, 不与 CAN 并发)
+  3. ModbusTCP_SyncFromCAN (FIFO → 历史缓存)
+  4. 按键扫描 (PA0 翻页) + IWDG 喂狗
 
-  5. 按键扫描（PA0 翻页切换）
-
-  6. IWDG_ReloadCounter (双保险喂狗 — Task_Unified + Task_Housekeep 各一份)
+Task_Housekeep (prio 0, 1s): OLED 刷新 + 栈水位
 ```
 
-> **关键约束**: SPI (W5500) 和 CAN 不可并发执行。两者共用 GPIOA 端口（PA5=SCK, PA11=CAN_RX），并发时 SPI 时钟信号干扰 CAN RX 导致不可恢复的比特错误。
+> **为何拆分 drain 任务**: W5500/Modbus 的 SocketCmd/SendData 可阻塞 100~700ms
+> (实测 T:700)。若 CAN drain 留在 Task_Unified, 阻塞期 ring(64 深, ~14ms 容量)
+> 必然溢出丢帧 (实测 F:OV)。Task_CAN_Drain (prio 3) 抢占 Task_Unified, 每 10ms
+> 强制 drain → ring 占用恒 ≤ 50 帧, 5000fps 实测零丢帧。
+>
+> **关键约束**: Task_CAN_Drain 只读内存 ring (不碰 CAN 硬件, 不碰 SPI), 不产生
+> SPI 边沿 → 物理上与顺序架构等价。SPI (W5500) 与 CAN 共用 GPIOA
+> (PA5=SCK, PA11=CAN_RX), 并发时 SPI 时钟干扰 CAN RX 采样 — 该约束由
+> Task_Unified 内部顺序执行满足。
+>
+> **CAN Tx**: 主站只接收, 不主动发帧 (无 ACK 时硬件重传推 TEC→255 BusOff)。
+> 从站心跳由 CAN 控制器硬件自动应答, 无需主站参与。
 
-### 3.2 CAN 接收架构（全通滤波器 + Task 轮询主路径）
+### 3.2 CAN 接收架构（FMP0 中断 + 紧凑环形缓冲 + 独立 drain 任务）
 
-当前使用**全通滤波器**，所有帧经 FIFO0 由 Task 轮询处理。
-FIFO1 中断+环形缓冲保留为冗余路径（防滤波器配置变化时丢帧）。
+主接收路径: 硬件 FIFO0 → FMP0 中断 ISR (`USB_LP_CAN1_RX0_IRQHandler`, prio 8)
+→ ring_high (64 深紧凑帧) → Task_CAN_Drain → CAN_ProcessFrame。
 
 | FIFO | 接收方式 | 缓冲区 | 说明 |
 |------|---------|--------|------|
-| **FIFO0** | **Task 轮询** (10ms 周期) | HW FIFO (3 深) + g_rx_ring_high(环形缓冲) | 主路径，所有帧经此处理 |
-| **FIFO1** | ISR → 环形缓冲 → Task drain | g_rx_ring_norm (32 深) | 冗余路径，当前罕见帧 |
+| **FIFO0** | **FMP0 ISR** → ring_high | ring_high (64 深, RingFrame_t 12B) | 主路径, 全通滤波所有帧 |
+| **FIFO1** | ISR → ring_norm (FMP1 禁用) | ring_norm (4 深) | fallback, 正常无帧 |
 
-#### FIFO0 轮询（Task_Unified 内，主接收路径）
+**紧凑帧 RingFrame_t (12B, 原 CanRxMsg 20B)** — RAM 约束下 64 深必须紧凑:
 
 ```c
-{   CanRxMsg rx2;
-    while (CAN_MessagePending(CAN1, CAN_FIFO0) > 0) {
-        CAN_Receive(CAN1, CAN_FIFO0, &rx2);
-        // 复制到 g_isr_rx_frame → CAN_ProcessFrame
-        CAN_ProcessFrame(&g_isr_rx_frame);
+typedef struct {
+    uint16_t StdId;   /* 协议只用标准帧 StdId≤0x3FF */
+    uint8_t  DLC;
+    uint8_t  Data[8];
+} RingFrame_t;   /* sizeof = 12 (对齐 2) */
+/* 去 ExtId/IDE/RTR/FMI — 协议无信息量。64 深 CanRxMsg 会 L6406E RAM 溢出。
+ * ring_high 64 + ring_norm 4 = 824B (map 实测), 全工程 RAM 余 896B。 */
+```
+
+**FMP0 ISR (只搬运不解析, 无锁 SPSC push)**:
+
+```c
+void USB_LP_CAN1_RX0_IRQHandler(void) {
+    /* ⚠️ F103 md 启动文件向量名是 USB_LP_CAN1_RX0, 不是 CAN1_RX0! */
+    while (CAN_GetITStatus(CAN1, CAN_IT_FMP0) != RESET) {
+        CanRxMsg msg; RingFrame_t rf;
+        CAN_Receive(CAN1, CAN_FIFO0, &msg);
+        rf.StdId = (uint16_t)msg.StdId; rf.DLC = msg.DLC;
+        memcpy(rf.Data, msg.Data, 8);
+        RxRingHigh_push(&g_rx_ring_high, &rf);   /* 锁无关 SPSC, 无 RTOS API */
+        CAN_ClearITPendingBit(CAN1, CAN_IT_FMP0);
     }
 }
 ```
 
-#### FIFO1 中断 + 环形缓冲（冗余路径）
+**Task_CAN_Drain drain (任务只读软件 ring, 不碰硬件 FIFO)**:
 
 ```c
-// CAN1_RX1_IRQHandler (优先级 8): 只搬运不解析
-void CAN1_RX1_IRQHandler(void) {
-    while (CAN_GetITStatus(CAN1, CAN_IT_FMP1) != RESET) {
-        CAN_Receive(CAN1, CAN_FIFO1, &msg);
-        ring_push(&g_rx_ring_norm, &msg);    // 锁无关 SPSC 环形缓冲
-        CAN_ClearITPendingBit(CAN1, CAN_IT_FMP1);
-    }
-}
-
-// Task_Unified drain: 从环形缓冲取出帧
-while (ring_pop(&g_rx_ring_norm, &rx_msg) == 0) {
-    // 复制到 g_isr_rx_frame → CAN_ProcessFrame
+RingFrame_t rf;
+while (RxRingHigh_pop(&g_rx_ring_high, &rf) == 0) {
+    g_isr_rx_frame.StdId = rf.StdId; g_isr_rx_frame.DLC = rf.DLC;
+    memcpy(g_isr_rx_frame.Data, rf.Data, 8);
+    CAN_ProcessFrame(&g_isr_rx_frame);
 }
 ```
+
+> **向量名陷阱**: F103 启动文件把 IRQ20 映射到 `USB_LP_CAN1_RX0_IRQHandler` (weak)。
+> 若代码定义 `CAN1_RX0_IRQHandler`, linker 当未用符号删除, 向量指向 weak 死循环
+> → FMP0 一开首帧即挂死 (启动屏卡死)。RX1/SCE 名字正常, 只有 RX0 是 USB 混合名。
+> 验收必须查 map 确认 136B 真实代码进向量。
 
 ### 3.3 CAN ISR 优先级
 
 | ISR | 优先级 | 说明 |
 |-----|--------|------|
-| CAN1_RX1_IRQHandler (FIFO1) | **8** | < configMAX_SYSCALL(5) → 不干扰调度器 |
-| CAN1_RX0_IRQHandler (FIFO0) | — | **禁用**（Task 轮询替代） |
-| CAN1_SCE_IRQHandler | **6** | 只读 ESR 寄存器，不做业务回调 |
+| USB_LP_CAN1_RX0_IRQHandler (FIFO0) | **8** | FMP0 中断, 只 CAN_Receive→ring_push, 无 RTOS API |
+| CAN1_RX1_IRQHandler (FIFO1) | **8** | FMP1 禁用, 正常不触发 (ring_norm fallback) |
+| CAN1_SCE_IRQHandler | **6** | ERR/BOF 中断禁用, 不执行 |
 
-> **注意**: 优先级 8 低于 BASEPRI 阈值 (0x50)，ISR 期间不阻止 FreeRTOS 临界区。
-> ISR 内不调用任何 FreeRTOS API（无 xSemaphoreGiveFromISR、无 portYIELD_FROM_ISR）。
+> **注意**: 优先级 8 ≥ configMAX_SYSCALL (0x50), 会被 FreeRTOS 临界区 (BASEPRI) 屏蔽,
+> 因此 ISR 内不调用任何 FreeRTOS API (无 xSemaphoreGiveFromISR、无 portYIELD_FROM_ISR)。
 
 ### 3.4 CAN 硬件滤波器
 
@@ -162,8 +180,8 @@ filter.CAN_FilterFIFOAssignment   = CAN_FIFO0;
 ```
 
 > 之前使用双滤波器（FIFO0=紧急 0x100-0x1FF, FIFO1=常态 0x200-0x3FF）配合双 ISR。
-> 因 FIFO0 ISR 干扰调度器，改为 Task 轮询 FIFO0 + 全通滤波器简化架构。
-> FIFO1 中断保留用于环形缓冲传输（CAN1_RX1_IRQHandler 优先级 8，只做 ring_push）。
+> 现用全通滤波器 + FMP0 ISR (prio 8) → ring_high。FIFO1 中断保留为 fallback
+> （CAN1_RX1_IRQHandler, FMP1 禁用, 只做 ring_push）。
 
 ### 3.5 CAN_ProcessFrame（Task 上下文调用）— 精简版
 
@@ -195,6 +213,11 @@ CAN_ProcessFrame:
 | ErrorMonitor | ABOM=DISABLE, INRQ 协议恢复: 200ms 间隔, 连续 5 次 BusOff 后拉长到 3s。g_boff_consec 边沿检测防重复累加 |
 | CalcBusLoad | 100ms 窗口滑动计算 → 负载 >70% 限速 / >90% 紧急模式 |
 | CAN_SendFrame | 1ms 超时轮询 → 失败返回 1 |
+
+> **负载折算 (CAN_FRAME_BITS=122)**: 8 字节标准帧实际 ~122 位 (0x55 低填充实测,
+> 500k/4100fps 反推)。`负载% = 帧率 × 122 / 500000 × 100%`。
+> 70% 阈值 = 2869fps, 90% 阈值 = 3689fps, 物理上限 500000/122 ≈ 4100fps = 100%。
+> 原 108 位 (无填充最小值) 低估真实占用 — 5000fps 压测时显示 88.56% 实为总线已满。
 
 #### HeartBeatCheck（三态标记, 每节点独立判定）
 
@@ -424,6 +447,9 @@ static uint8_t SPI_SendByte(uint8_t dat) {
 | 11 | CAN_ProcessFrame 缺少 checksum 校验 | 干扰帧 DLC=8 但 data 被损坏 → 污染节点时间戳 | 加 XOR 异或校验, byte7不一致直接丢弃 |
 | 12 | HeartBeatCheck error_level 门禁牵连全节点 | S2断线后 error_level≥2 → 整函数跳过 → S1也判离线 | 去掉 error_level≥2 gate, 每节点独立判定 |
 | 13 | 告警帧无收发限流 | 从站连续上报 ALARM → FIFO堆积 → 正常帧处理延迟 | 从站 1→2s 降频, 主站 200ms/节点限频, 丢弃计数 |
+| 14 | 主站 RX0 ISR 向量名错误 → 首帧卡死 | F103 md 启动文件 RX0 向量是 `USB_LP_CAN1_RX0_IRQHandler`, 代码定义 `CAN1_RX0_IRQHandler` 被 linker 当未用符号删除 → 向量指向 weak 死循环 | 改名 `USB_LP_CAN1_RX0_IRQHandler`, 查 map 确认 136B 代码进向量 |
+| 15 | 高压下 W5500 阻塞饿死 CAN ring | W5500 SocketCmd/SendData 超时 100ms~1s 阻塞 Task_Unified, ring(64深)溢出丢帧 (F:OV) | 独立 Task_CAN_Drain (prio 3) 每 10ms 抢占 drain, ring 占用恒 ≤50 帧 |
+| 16 | 原 FIFO0 轮询 300fps 上限 | 硬件 FIFO 3 深 × 10ms 轮询 = 300fps, 总线 90% 时丢 97% | FMP0 ISR + ring64 紧凑帧 + drain 任务 → 5000fps 零丢帧 (总线物理上限 ~4100fps) |
 
 ---
 
