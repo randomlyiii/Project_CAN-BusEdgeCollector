@@ -144,7 +144,7 @@ static void Run_SlaveSim(void)
 
 static void Run_Stress(void)
 {
-    uint32_t next_us     = Delay_GetUs();
+    uint32_t last_us     = Delay_GetUs();
     uint32_t interval_us = 0;
     uint32_t disp_last   = 0;
     uint32_t start_ms    = Delay_GetTick();
@@ -162,9 +162,9 @@ static void Run_Stress(void)
 
         CAN_RxPoll();                       /* 排空 RX + 读 TEC/REC */
 
-        if (TEST_FRAME_RATE > 0) {          /* 节拍 */
-            next_us += interval_us;
-            while (Delay_GetUs() < next_us) { }
+        if (TEST_FRAME_RATE > 0) {          /* 节拍 (相对差值, 对 Delay_GetUs 59.65s 回绕安全) */
+            while ((Delay_GetUs() - last_us) < interval_us) { }
+            last_us = Delay_GetUs();
         }
 
 #if (TEST_DISP_ENABLE == 1)
