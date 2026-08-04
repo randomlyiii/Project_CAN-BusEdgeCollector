@@ -22,6 +22,8 @@ static uint8_t  g_chip_ok         = 0;
 static uint32_t g_close_wait_tick = 0;
 static uint32_t g_closed_tick     = 0;
 static uint8_t  g_phy_linked      = 0;
+static uint32_t g_reinit_throttle_tick = 0;   /* SPI 异常重初始化节流 */
+static uint32_t g_cfg_verify_tick        = 0;   /* 网络参数周期校验 */
 
 /* ===================== SPI 控制字节 (模板验证) ===================== */
 #define T_VDM       0x00
@@ -237,6 +239,25 @@ int8_t W5500_Init(void)
 
 uint8_t W5500_IsOnline(void) { return g_chip_ok; }
 
+/* ===================== 自动恢复 =====================
+ * 背景: SPI_SendByte 超时 → g_chip_ok=0 → 旧代码永久死, 需断电重启.
+ *       碰触 W5500 模块导致 SPI/电源引脚瞬时接触不良即触发.
+ *
+ * 快探前置: 芯片真死时 R_Common 超时仅 ~2µs, 不烧 W5500_Init 的
+ *       50+200+10ms 固定延时; 芯片复活后下一次节流窗口即满血恢复.
+ * 节流: 死芯片期间每 500ms 才尝试一次, 不占 Task_Unified (CAN drain
+ *       任务 prio 3 照常抢占, 负载度不受影响). */
+int8_t W5500_Recovery(void)
+{
+    if (Delay_GetTick() - g_reinit_throttle_tick < W5500_REINIT_INTERVAL_MS) return W5500_ERR_SPI;
+    g_reinit_throttle_tick = Delay_GetTick();
+    if (R_Common(REG_VERSIONR) != 0x04) return W5500_ERR_SPI;   /* SPI/电源仍断 */
+    if (W5500_Init() != W5500_OK)                    return W5500_ERR_SPI;
+    if (W5500_ConfigNetwork() != W5500_OK)           return W5500_ERR_SPI;
+    if (W5500_TCPServer_Start(MODBUS_PORT) != W5500_OK) return W5500_ERR_TIMEOUT;
+    return W5500_OK;
+}
+
 /* ===================== 网络配置 ===================== */
 static uint8_t g_mac[6] = W5500_CFG_MAC;
 static uint8_t g_ip[4]  = W5500_CFG_IP;
@@ -300,7 +321,18 @@ int8_t W5500_TCPServer_Start(uint16_t port)
 
 void W5500_TCPServer_Run(void)
 {
-    if (!g_chip_ok) return;
+    if (!g_chip_ok) { W5500_Recovery(); return; }
+
+    /* 周期校验: 芯片被外部复位(电源抖动)后 SPI 仍活但 IP 配置清零,
+     * g_chip_ok 保持 1 走不进 Recovery → 每 1s 校验 SIPR 前两字节.
+     * (R_Common 超时自身也会清 g_chip_ok, 故下方统一复查) */
+    if (Delay_GetTick() - g_cfg_verify_tick > 1000) {
+        g_cfg_verify_tick = Delay_GetTick();
+        if (R_Common(REG_SIPR) == 0 && R_Common(REG_SIPR + 1) == 0)
+            g_chip_ok = 0;              /* 配置被清 → 下次循环走 Recovery */
+        if (!g_chip_ok) return;
+    }
+
     uint8_t sr = R_Sock(0, OFF_SN_SR);
     if (!g_chip_ok) return;             /* SPI 异常 — 放弃本轮操作 */
     g_socket_status = sr; g_phy_linked = W5500_LinkUp();
@@ -325,7 +357,7 @@ void W5500_TCPServer_Run(void)
         break;
     }
     case SOCK_CLOSE_WAIT:
-        if (Delay_GetTick() - g_close_wait_tick > 1000) {
+        if (Delay_GetTick() - g_close_wait_tick > 200) {
             g_close_wait_tick = Delay_GetTick();
             SocketCmd(0, Sn_CR_DISCON, SOCK_CLOSED);
             SocketCmd(0, Sn_CR_CLOSE, SOCK_CLOSED);
@@ -333,7 +365,7 @@ void W5500_TCPServer_Run(void)
         break;
     case SOCK_CLOSED:
         g_w5500_online = 0;
-        if (Delay_GetTick() - g_closed_tick > 3000)
+        if (Delay_GetTick() - g_closed_tick > 500)
             { g_closed_tick = Delay_GetTick(); W5500_TCPServer_Start(MODBUS_PORT); }
         break;
     }

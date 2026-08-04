@@ -1,7 +1,7 @@
 # CAN 通信规范 — CAN Bus Edge Collector
 
 > 适用范围: 主站 + 从站 CAN 通信层  
-> 最后更新: 2026-08-04 (第十次修改: FMP0 ISR + 紧凑 ring64 + 独立 drain 任务; 负载折算 108→122)
+> 最后更新: 2026-08-04 (第十一次修改: W5500 自动恢复 — SPI 异常快探重初始化 + 1s SIPR 校验 + 恢复窗口缩短)
 
 ---
 
@@ -421,12 +421,39 @@ static uint8_t SPI_SendByte(uint8_t dat) {
 }
 ```
 
-### 5.2 超时后的行为
+### 5.2 超时后的行为 — 自动恢复（不再需重启）
 
-- `g_chip_ok = 0` → 后续 `W5500_TCPServer_Run()` 立即返回，不执行 SPI 操作
-- `ETH_StateStr()` 读到 `g_chip_ok=0` → OLED 显示 `"ETH:FAIL"`
-- 超时由 CAN ALARM 帧在 SPI 走线上的电磁干扰引起（瞬态，不影响后续通信）
-- 当前无自动恢复逻辑（`g_chip_ok` 保持 0），W5500 通信中断后需重启
+```c
+/* W5500_Recovery(): SPI 异常后的全量重初始化, 由 W5500_TCPServer_Run 顶部调用 */
+int8_t W5500_Recovery(void) {
+    if (Delay_GetTick() - g_reinit_throttle_tick < W5500_REINIT_INTERVAL_MS) return W5500_ERR_SPI;
+    g_reinit_throttle_tick = Delay_GetTick();
+    if (R_Common(REG_VERSIONR) != 0x04) return W5500_ERR_SPI;  /* 快探: SPI/电源仍断, 仅 ~2µs */
+    if (W5500_Init() != W5500_OK)                  return W5500_ERR_SPI;
+    if (W5500_ConfigNetwork() != W5500_OK)         return W5500_ERR_SPI;
+    if (W5500_TCPServer_Start(MODBUS_PORT) != W5500_OK) return W5500_ERR_TIMEOUT;
+    return W5500_OK;
+}
+
+void W5500_TCPServer_Run(void) {
+    if (!g_chip_ok) { W5500_Recovery(); return; }     /* ← 不死等, 转恢复 */
+    /* 1s 周期 SIPR 校验: 芯片被外部复位(电源抖动)后 SPI 仍活但 IP 清零,
+     * g_chip_ok 保持 1 走不进 Recovery → 校验强制转 Recovery */
+    if (Delay_GetTick() - g_cfg_verify_tick > 1000) {
+        g_cfg_verify_tick = Delay_GetTick();
+        if (R_Common(REG_SIPR)==0 && R_Common(REG_SIPR+1)==0) g_chip_ok = 0;
+        if (!g_chip_ok) return;
+    }
+    /* ... 原 socket 处理 ... */
+}
+```
+
+- `g_chip_ok = 0` → `W5500_TCPServer_Run()` 顶部转 `W5500_Recovery()`：快探 SPI（超时仅 ~2µs）→ 全量重初始化 `Init + ConfigNetwork + TCPServer_Start`，带 500ms 节流。死芯片期间每轮只花 2µs，不占 Task_Unified（CAN drain prio 3 照常抢占，负载度无影响）；接触恢复后下一次节流窗口满血复活
+- **快探前置**: 芯片真死时 R_Common 超时仅 ~2µs 就返回，不烧 W5500_Init 的 50+200+10ms 固定延时；只有 SPI 实际活时才花 260ms 全量初始化
+- **1s 周期 SIPR 校验**: 芯片被外部复位（电源抖动）后 SPI 仍活但 IP 配置清零时强制走 Recovery（否则 socket 重开也不应答 Modbus，假活）
+- 恢复窗口缩短：CLOSE_WAIT 1000→200ms、CLOSED 3000→500ms，碰一下恢复 4s → <1s
+- `ETH_StateStr()` 读到 `g_chip_ok=0` → OLED 显示 `"ETH:FAIL"`，恢复后自动回 LSN/CON
+- **副作用**: Recovery 内 `W5500_Init` 会 `RingBuf_Init` 清空 RX ring — 连接已死残留帧本就是垃圾，可接受。Recovery 只在 Task_Unified（SPI 唯一主）调用，不违反顺序架构约束
 
 ---
 
@@ -450,6 +477,7 @@ static uint8_t SPI_SendByte(uint8_t dat) {
 | 14 | 主站 RX0 ISR 向量名错误 → 首帧卡死 | F103 md 启动文件 RX0 向量是 `USB_LP_CAN1_RX0_IRQHandler`, 代码定义 `CAN1_RX0_IRQHandler` 被 linker 当未用符号删除 → 向量指向 weak 死循环 | 改名 `USB_LP_CAN1_RX0_IRQHandler`, 查 map 确认 136B 代码进向量 |
 | 15 | 高压下 W5500 阻塞饿死 CAN ring | W5500 SocketCmd/SendData 超时 100ms~1s 阻塞 Task_Unified, ring(64深)溢出丢帧 (F:OV) | 独立 Task_CAN_Drain (prio 3) 每 10ms 抢占 drain, ring 占用恒 ≤50 帧 |
 | 16 | 原 FIFO0 轮询 300fps 上限 | 硬件 FIFO 3 深 × 10ms 轮询 = 300fps, 总线 90% 时丢 97% | FMP0 ISR + ring64 紧凑帧 + drain 任务 → 5000fps 零丢帧 (总线物理上限 ~4100fps) |
+| 17 | W5500 SPI 异常后永久死 | 碰触模块致 SPI/电源引脚瞬时接触不良 → `g_chip_ok=0` 无自动恢复, 需断电重启; 电源抖动复位后 IP 清零假活 | `W5500_Recovery` 快探+500ms 节流+全量重初始化; 1s SIPR 校验; 恢复窗口 4s→<1s |
 
 ---
 

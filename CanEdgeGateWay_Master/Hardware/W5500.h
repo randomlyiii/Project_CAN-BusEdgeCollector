@@ -74,6 +74,7 @@
 #define SOCK_CMD_TIMEOUT_MS        100
 #define TCP_KEEPALIVE_ENABLE       0x01
 #define PHY_LINK_MASK              0x01
+#define W5500_REINIT_INTERVAL_MS   500   /* SPI 异常后重初始化节流 */
 
 /* ===================== 环形接收缓冲区 ===================== */
 typedef struct {
@@ -94,6 +95,7 @@ typedef struct {
 /* ===================== API ===================== */
 int8_t   W5500_Init(void);
 uint8_t  W5500_IsOnline(void);
+int8_t   W5500_Recovery(void);   /* SPI 异常后全量重初始化: 快探+节流+Init+ConfigNetwork */
 
 int8_t   W5500_ConfigNetwork(void);
 int8_t   W5500_SetNetParam(uint8_t *mac, uint8_t *ip, uint8_t *sub, uint8_t *gw);
