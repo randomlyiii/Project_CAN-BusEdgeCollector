@@ -3,7 +3,7 @@
  *
  * Architecture (dual-FIFO + dual lock-free ring buffer):
  *
- *   [HW FIFO0: 紧急 0x100-0x1FF]  →  CAN1_RX0_IRQHandler
+ *   [HW FIFO0: 紧急 0x100-0x1FF]  →  USB_LP_CAN1_RX0_IRQHandler
  *   [HW FIFO1: 常态 0x200-0x3FF]  →  CAN1_RX1_IRQHandler
  *        ↓ (ISR 只搬运，不解析，各写各的 ring)
  *   ring_push → g_rx_ring_high / g_rx_ring_norm (锁无关 SPSC)
@@ -37,28 +37,8 @@ volatile uint8_t g_dbg_step = 0;
  *       TX FIFO 不再推入，不再需要信号量。 */
 
 /* ---- RX Ring Buffers (ISR → Task, lock-free SPSC, each ring own ISR) ---- */
-RxRingBuf           g_rx_ring_high;
-RxRingBuf           g_rx_ring_norm;
-
-/* ================================================================
- * Ring Buffer Operations — 单生产者(ISR)/单消费者(Task)
- *
- * 约束:
- *   深度必须为 2 的幂 → 用 & MASK 代替 % 取模
- *   满判据留空一格: (head+1) & MASK == tail
- *   uint8_t 索引在 32 位 MCU 上是单字节原子操作
- * ================================================================ */
-static inline uint8_t ring_push(RxRingBuf *rb, CanRxMsg *msg)
-{
-    uint8_t next = (uint8_t)((rb->head + 1) & RX_RING_MASK);
-    if (next == rb->tail) {
-        rb->overflow_cnt++;
-        return 1;  /* 环形缓冲满 */
-    }
-    rb->frames[rb->head] = *msg;
-    rb->head = next;
-    return 0;
-}
+RxRingHigh          g_rx_ring_high;
+RxRingNorm          g_rx_ring_norm;
 
 /* ---- ISR → task shared frame buffer ---- */
 CanRxFrame          g_isr_rx_frame;
@@ -76,8 +56,10 @@ static uint32_t g_throttle_stable_cnt = 0;  /* hysteresis counter */
 #define LOAD_RECOVER_MID        8500  /* <85% exit emergency */
 #define LOAD_RECOVER_LOW        6500  /* <65% exit low-freq throttle */
 
-/* ---- CAN bit timing: 500kbps standard frame ≈ 108 bits (worst case with stuffing) ---- */
-#define CAN_FRAME_BITS          108
+/* ---- 负载折算位数: 8字节标准帧实际 ~122 位 (0x55 低填充实测, 500k/4100fps)。
+ *     原 108 是无填充最小值, 折算低估真实总线占用 (4100fps 显示 88.56% 实为 ~100%)。
+ *     节流阈值随之移动: 90% → 500k×0.9/122 ≈ 3690fps 真实帧。 ---- */
+#define CAN_FRAME_BITS          122
 
 /* ---- Weak callbacks ---- */
 __weak void CAN_User_OnError(uint8_t level)      { (void)level; }
@@ -234,12 +216,10 @@ void CAN_User_Init(void)
 
 void CAN_EnableInterrupts(void)
 {
-    /* 全部 CAN 中断禁用 — FIFO0 由 Task 轮询, FIFO1 无帧.
-       之前开启 FMP1 中断可能导致 CAN 控制器检查空 FIFO1 时产生内部状态异常. */
-    // CAN_ITConfig(CAN1, CAN_IT_FMP0, DISABLE);
-    // CAN_ITConfig(CAN1, CAN_IT_FMP1, DISABLE);
-    // CAN_ITConfig(CAN1, CAN_IT_ERR, DISABLE);
-    // CAN_ITConfig(CAN1, CAN_IT_BOF, DISABLE);
+    /* FMP0 中断: RX0 ISR 把 FIFO0 帧搬入 ring_high (无锁 SPSC push).
+       FMP1 保持禁用 — 全通滤波所有帧走 FIFO0, 且空 FIFO1 检查曾致异常.
+       ERR/BOF 中断禁用 — SCE ISR 风暴曾抢占 Task 导致心跳超时. */
+    CAN_ITConfig(CAN1, CAN_IT_FMP0, ENABLE);
     CAN_NVIC_Init();
 }
 
@@ -347,14 +327,25 @@ send_ok:
 }
 
 /* ================================================================
- * ISR: CAN FIFO0 Receive — 禁用
+ * ISR: CAN FIFO0 Receive — 主接收路径
  *
- * FIFO0 帧由 Task 轮询读取（已验证 ISR 方案导致调度器异常）
+ * 职责 ONLY: CAN_Receive → pack 紧凑帧 → 无锁 push ring_high → 退出
+ * 禁止: FreeRTOS API (prio 8 < syscall 阈值 5), 阻塞, 协议解析。
+ * 上一版 ISR 崩溃根因: ISR 内调 RTOS API + 空 FIFO1 检查 (本版已规避)。
  * ================================================================ */
 
-void CAN1_RX0_IRQHandler(void)
+void USB_LP_CAN1_RX0_IRQHandler(void)
 {
-    /* 未使用 — FIFO0 由 Task_Unified 轮询 */
+    while (CAN_GetITStatus(CAN1, CAN_IT_FMP0) != RESET) {
+        CanRxMsg    msg;
+        RingFrame_t rf;
+        CAN_Receive(CAN1, CAN_FIFO0, &msg);
+        rf.StdId = (uint16_t)msg.StdId;
+        rf.DLC   = msg.DLC;
+        memcpy(rf.Data, msg.Data, 8);
+        RxRingHigh_push(&g_rx_ring_high, &rf);
+        CAN_ClearITPendingBit(CAN1, CAN_IT_FMP0);
+    }
 }
 
 /* ================================================================
@@ -366,9 +357,13 @@ void CAN1_RX0_IRQHandler(void)
 void CAN1_RX1_IRQHandler(void)
 {
     while (CAN_GetITStatus(CAN1, CAN_IT_FMP1) != RESET) {
-        CanRxMsg msg;
+        CanRxMsg    msg;
+        RingFrame_t rf;
         CAN_Receive(CAN1, CAN_FIFO1, &msg);
-        ring_push(&g_rx_ring_norm, &msg);
+        rf.StdId = (uint16_t)msg.StdId;
+        rf.DLC   = msg.DLC;
+        memcpy(rf.Data, msg.Data, 8);
+        RxRingNorm_push(&g_rx_ring_norm, &rf);
         CAN_ClearITPendingBit(CAN1, CAN_IT_FMP1);
     }
 }

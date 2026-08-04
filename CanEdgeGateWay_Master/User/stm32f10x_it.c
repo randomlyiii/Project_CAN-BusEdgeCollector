@@ -5,7 +5,7 @@
  *   SysTick_Handler   → System/Delay.c (calls FreeRTOS xPortSysTickHandler)
  *   SVC_Handler       → FreeRTOS/src/port.c (vPortSVCHandler)
  *   PendSV_Handler    → FreeRTOS/src/port.c (xPortPendSVHandler)
- *   CAN1_RX0_IRQHandler → Hardware/CAN_User.c
+ *   USB_LP_CAN1_RX0_IRQHandler → Hardware/CAN_User.c
  *   CAN1_SCE_IRQHandler → Hardware/CAN_User.c
  */
 

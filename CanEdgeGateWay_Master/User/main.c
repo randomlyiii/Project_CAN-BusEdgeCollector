@@ -26,13 +26,15 @@ void _sys_exit(int x) { x = x; }
 
 static TaskHandle_t hTask_Unified   = NULL;
 static TaskHandle_t hTask_Housekeep = NULL;
+static TaskHandle_t hTask_CAN_Drain = NULL;
 
 #define STACK_UNIFIED     768
 #define STACK_HOUSEKEEP   384
+#define STACK_CAN_DRAIN   256
 
 static char g_oled_line[4][17];
 static uint8_t g_eth_was_connected = 0;
-static volatile uint8_t g_fmp0_before = 0;  /* DBG: FMP0 drain 前快照 */
+volatile uint8_t  g_can_ready = 0;           /* CAN+FIFO 初始化完成标志 (FIFO mutex 已创建) */
 
 /* ---- Page-switch key (PA0, GND=press) ---- */
 #define KEY_PAGE_PORT    GPIOA
@@ -281,10 +283,11 @@ static void OLED_BuildPage3(void)
             err_lvl, OLED_CompactNum(nb2, rc_cnt),
             (unsigned int)expired);
 
-    /* "RX:65.5K F:OK" = 11 chars (F=FIFO status) */
+    /* "RX:65.5K F:OK" = 11 chars (F=ring 溢出, 主站 RX 丢帧指示;
+     *   Modbus FIFO 溢出仍看上行 O: 字段) */
     sprintf(g_oled_line[3], "RX:%s F:%s",
             OLED_RxStr(nb3),
-            ov_cnt > 0U ? "OV" : "OK");
+            g_rx_ring_high.overflow_cnt > 0U ? "OV" : "OK");
 }
 
 /**
@@ -344,16 +347,82 @@ static void OLED_UpdateDisplay(void)
  * CAN TX: 非阻塞，发前检查空闲邮箱，无邮箱则留到下一周期。
  * ================================================================ */
 
+/* ========= 独立 CAN drain 任务: 解耦 W5500 阻塞 =========
+ *
+ * 背景: Task_Unified 内 W5500/Modbus 可阻塞 100~700ms (SocketCmd 超时 /
+ *       SendData 超时), 若 ring drain 在同任务, 阻塞期 ring(64深,~14ms容量)
+ *       必然溢出丢帧 (实测 T:700 + F:OV)。
+ *
+ * 本任务 prio 3 > Task_Unified(1): 每 2ms 抢占, 强制 drain ring_high/norm。
+ * 只读内存 ring + 调 CAN_ProcessFrame (不碰 CAN 硬件, 不碰 SPI),
+ * 不产生 SPI 边沿 → 物理上与顺序架构等价, 不违反 [[spi-can-concurrency]]。
+ * ================================================================ */
+
+static void Task_CAN_Drain(void *pvParameters)
+{
+    (void)pvParameters;
+    TickType_t xLastWake = xTaskGetTickCount();
+
+    for (;;) {
+        if (!g_can_ready) {
+            /* CAN 未初始化: FIFO mutex 尚未创建 (在 Task_Unified), 此时
+             * 处理帧会 xSemaphoreTake(NULL) → HardFault. 只清 ring 不处理. */
+            RingFrame_t rf;
+            while (RxRingHigh_pop(&g_rx_ring_high, &rf) == 0) { }
+            while (RxRingNorm_pop(&g_rx_ring_norm, &rf) == 0) { }
+            vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(10));  /* 1 tick; 不可用 2ms (pdMS_TO_TICKS(2)=0 忙转) */
+            continue;
+        }
+        g_dbg_step = 1;
+
+        /* 主路径: drain ring_high (RX0 ISR 填充, 全通滤波所有帧) */
+        {   RingFrame_t rf;
+            while (RxRingHigh_pop(&g_rx_ring_high, &rf) == 0) {
+                g_isr_rx_frame.StdId = rf.StdId;
+                g_isr_rx_frame.IDE   = 0;
+                g_isr_rx_frame.RTR   = 0;
+                g_isr_rx_frame.DLC   = rf.DLC;
+                g_isr_rx_frame.FMI   = 0;
+                memcpy(g_isr_rx_frame.Data, rf.Data, 8);
+                CAN_ProcessFrame(&g_isr_rx_frame);
+            }
+        }
+
+        g_dbg_step = 2;
+        /* Fallback: drain ring_norm (FIFO1, FMP1 禁用, 正常无帧) */
+        {   RingFrame_t rf;
+            while (RxRingNorm_pop(&g_rx_ring_norm, &rf) == 0) {
+                g_isr_rx_frame.StdId = rf.StdId;
+                g_isr_rx_frame.IDE   = 0;
+                g_isr_rx_frame.RTR   = 0;
+                g_isr_rx_frame.DLC   = rf.DLC;
+                g_isr_rx_frame.FMI   = 0;
+                memcpy(g_isr_rx_frame.Data, rf.Data, 8);
+                CAN_ProcessFrame(&g_isr_rx_frame);
+            }
+        }
+
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(10));  /* 1 tick=10ms; 5000fps→50帧/10ms < ring64 */
+    }
+}
+
 static void Task_Unified(void *pvParameters)
 {
     (void)pvParameters;
     TickType_t xLastWake;
-    CanRxMsg   rx_msg;
 
     CAN_DeInit(CAN1); Delay_ms(10); CAN_User_Init();
     CAN_EnableInterrupts();     /* re-enable after DeInit killed them */
     vTaskDelay(pdMS_TO_TICKS(100));
     W5500_TCPServer_Start(MODBUS_PORT);
+
+    /* 丢弃启动期堆积 + 清零溢出计数: 上面 100ms 延迟期间 ISR 已把 ring
+     * 灌满(5000fps×100ms=500帧 > 64深), 不清零则 F:OV 永久置位,
+     * 掩盖稳态真实丢帧. 残留 64 帧随后正常 drain, 无影响. */
+    g_rx_ring_high.overflow_cnt = 0;
+    g_rx_ring_norm.overflow_cnt = 0;
+    g_can_ready = 1;   /* CAN+FIFO 就绪, Task_CAN_Drain 可开始处理帧 */
+
     xLastWake = xTaskGetTickCount();
 
     for (;;) {
@@ -361,60 +430,14 @@ static void Task_Unified(void *pvParameters)
         GPIO_SetBits(GPIOA, GPIO_Pin_1);        /* DBG: 高电平 = 循环开始 */
 
         /* ================================================================
-         * 1. CAN Rx — 从 ISR 已填好的环形缓冲 drain
+         * 1. CAN Rx — 已剥离到 Task_CAN_Drain (prio 3, 每 2ms 抢占 drain)
+         *
+         * 原因: W5500/Modbus 在本任务可阻塞 100~700ms (SocketCmd/SendData
+         *       超时), ring drain 留在本任务会被饿死 → ring(64深)溢出丢帧
+         *       (实测 T:700 + F:OV)。Task_CAN_Drain 只读内存 ring, 不碰
+         *       CAN 硬件/SPI, 不违反顺序架构。
          * ================================================================ */
-        GPIO_ResetBits(GPIOA, GPIO_Pin_1);      /* DBG: 低 = CAN_RX */
-        g_dbg_step = 1;
-        /* Drain emergency ring (FIFO0 → 0x100-0x1FF) */
-        while (ring_pop(&g_rx_ring_high, &rx_msg) == 0) {
-            g_isr_rx_frame.StdId = rx_msg.StdId;
-            g_isr_rx_frame.IDE   = rx_msg.IDE;
-            g_isr_rx_frame.RTR   = rx_msg.RTR;
-            g_isr_rx_frame.DLC   = rx_msg.DLC;
-            g_isr_rx_frame.FMI   = rx_msg.FMI;
-            memcpy(g_isr_rx_frame.Data, rx_msg.Data, 8);
-            CAN_ProcessFrame(&g_isr_rx_frame);
-        }
-        g_fmp0_before = (uint8_t)(CAN1->RF0R & 0x03); /* 快照: drain 前 FMP0 */
-
-        /* FIFO0 轮询 */
-        {   CanRxMsg rx2;
-            while (CAN_MessagePending(CAN1, CAN_FIFO0) > 0) {
-                CAN_Receive(CAN1, CAN_FIFO0, &rx2);
-                g_isr_rx_frame.StdId = rx2.StdId;
-                g_isr_rx_frame.IDE   = rx2.IDE;
-                g_isr_rx_frame.RTR   = rx2.RTR;
-                g_isr_rx_frame.DLC   = rx2.DLC;
-                g_isr_rx_frame.FMI   = rx2.FMI;
-                memcpy(g_isr_rx_frame.Data, rx2.Data, 8);
-                CAN_ProcessFrame(&g_isr_rx_frame);
-            }
-        }
-        /* DBG: FIFO1 直接轮询 Fallback (ISR 可能没触发) */
-        {   CanRxMsg rx3;
-            while (CAN_MessagePending(CAN1, CAN_FIFO1) > 0) {
-                CAN_Receive(CAN1, CAN_FIFO1, &rx3);
-                g_isr_rx_frame.StdId = rx3.StdId;
-                g_isr_rx_frame.IDE   = rx3.IDE;
-                g_isr_rx_frame.RTR   = rx3.RTR;
-                g_isr_rx_frame.DLC   = rx3.DLC;
-                g_isr_rx_frame.FMI   = rx3.FMI;
-                memcpy(g_isr_rx_frame.Data, rx3.Data, 8);
-                CAN_ProcessFrame(&g_isr_rx_frame);
-            }
-        }
-
-        g_dbg_step = 2;
-        /* Drain normal ring (FIFO1 → 0x200-0x3FF) */
-        while (ring_pop(&g_rx_ring_norm, &rx_msg) == 0) {
-            g_isr_rx_frame.StdId = rx_msg.StdId;
-            g_isr_rx_frame.IDE   = rx_msg.IDE;
-            g_isr_rx_frame.RTR   = rx_msg.RTR;
-            g_isr_rx_frame.DLC   = rx_msg.DLC;
-            g_isr_rx_frame.FMI   = rx_msg.FMI;
-            memcpy(g_isr_rx_frame.Data, rx_msg.Data, 8);
-            CAN_ProcessFrame(&g_isr_rx_frame);
-        }
+        GPIO_ResetBits(GPIOA, GPIO_Pin_1);      /* DBG: 低 = 本任务循环体开始 */
 
         g_dbg_step = 3;
         /* 2. CAN Tx — 主站只接收, 不主动发帧.
@@ -552,6 +575,7 @@ int main(void)
     ModbusTCP_Init();
     g_eth_was_connected = 0;
 
+    xTaskCreate(Task_CAN_Drain,"CANDrain", STACK_CAN_DRAIN, NULL, 3, &hTask_CAN_Drain);
     xTaskCreate(Task_Unified,  "Unified", STACK_UNIFIED,   NULL, 1, &hTask_Unified);
     xTaskCreate(Task_Housekeep,"HouseKp", STACK_HOUSEKEEP, NULL, 0, &hTask_Housekeep);
     CAN_EnableInterrupts();

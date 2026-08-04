@@ -25,27 +25,49 @@
  * 单生产者(ISR) + 单消费者(Task)，无需互斥锁。
  * 深度必须为 2 的幂，uint8_t 索引保证原子操作。
  * 满判据: (head+1) & MASK == tail  → 留空一格区分空/满
+ *
+ * RAM 约束 (STM32F103C8T6 20KB): 64 深 CanRxMsg(20B) 会 L6406E
+ * 溢出。紧凑帧 RingFrame_t=12B (去 ExtId/IDE/RTR/FMI，协议只用
+ * 标准数据帧 StdId≤0x3FF)，ring_high 64 + ring_norm 4 = 816B。
  * ================================================================ */
-#define RX_RING_DEPTH      32   /* 必须为 2 的幂 */
-#define RX_RING_MASK       (RX_RING_DEPTH - 1)
 
+/* 紧凑接收帧 — sizeof = 12 (对齐 2) */
 typedef struct {
-    CanRxMsg         frames[RX_RING_DEPTH];
-    volatile uint8_t head;          /* ISR 写入 (生产者) */
-    volatile uint8_t tail;          /* Task 读取 (消费者) */
-    volatile uint16_t overflow_cnt; /* 非零 = 软件环形缓冲满，丢帧计数 */
-} RxRingBuf;
+    uint16_t StdId;
+    uint8_t  DLC;
+    uint8_t  Data[8];
+} RingFrame_t;
 
-/* Task 侧出队: 从环形缓冲读一帧 (不碰硬件 FIFO)。
- * 返回 0=成功, 1=空。单消费者，无需锁。 */
-static inline uint8_t ring_pop(RxRingBuf *rb, CanRxMsg *msg)
-{
-    if (rb->tail == rb->head)
-        return 1;
-    *msg = rb->frames[rb->tail];
-    rb->tail = (uint8_t)((rb->tail + 1) & RX_RING_MASK);
-    return 0;
-}
+/* 宏生成指定深度的 SPSC ring + 内联 push/pop。
+ * ISR 侧只调 push (无锁，不调 FreeRTOS API)，
+ * Task 侧只调 pop。uint8_t head/tail 在 32 位 MCU 上原子。 */
+#define RX_RING_DEFINE(NAME, DEPTH)                                   \
+    typedef struct {                                                  \
+        RingFrame_t      frames[DEPTH];                               \
+        volatile uint8_t head;    /* ISR 写入 (生产者) */              \
+        volatile uint8_t tail;    /* Task 读取 (消费者) */             \
+        volatile uint16_t overflow_cnt;  /* 满=丢帧计数 */             \
+    } NAME;                                                           \
+    static inline uint8_t NAME##_push(NAME *rb, RingFrame_t *f)       \
+    {                                                                 \
+        uint8_t next = (uint8_t)((rb->head + 1) & (DEPTH - 1));       \
+        if (next == rb->tail) { rb->overflow_cnt++; return 1; }       \
+        rb->frames[rb->head] = *f;                                    \
+        rb->head = next;                                              \
+        return 0;                                                     \
+    }                                                                 \
+    static inline uint8_t NAME##_pop(NAME *rb, RingFrame_t *f)        \
+    {                                                                 \
+        if (rb->tail == rb->head) return 1;                           \
+        *f = rb->frames[rb->tail];                                    \
+        rb->tail = (uint8_t)((rb->tail + 1) & (DEPTH - 1));           \
+        return 0;                                                     \
+    }
+
+/* 主路径: FIFO0 帧流 (全通滤波 → 所有帧走这里), 64 深 */
+RX_RING_DEFINE(RxRingHigh, 64)
+/* Fallback: FIFO1 帧流 (正常无帧), 4 深 */
+RX_RING_DEFINE(RxRingNorm, 4)
 
 /* ---- CAN ID bases ---- */
 #define CAN_ID_EMERGENCY_BASE     0x100
@@ -122,13 +144,13 @@ extern volatile uint16_t  g_bus_off_recovery_cnt;
 extern volatile uint8_t   g_system_throttle_level;
 
 /* ---- RX Ring Buffers (ISR→Task, 锁无关 SPSC, 各 ISR 写各自的) ---- */
-extern RxRingBuf         g_rx_ring_high;
-extern RxRingBuf         g_rx_ring_norm;
+extern RxRingHigh         g_rx_ring_high;
+extern RxRingNorm         g_rx_ring_norm;
 
 /* DBG: 调试步进计数 */
 extern volatile uint8_t  g_dbg_step;
 
-/* FIFO0 由 Task 轮询（ISR 禁用） */
+/* FIFO0 帧由 RX0 ISR 搬入 ring_high (FMP0 中断使能) */
 
 /* ---- CAN init ---- */
 void CAN_User_Init(void);
@@ -139,7 +161,7 @@ void CAN_ResetBus(void);
 uint8_t CAN_SendFrame(uint32_t id, uint8_t *data, uint8_t len);
 
 /* ---- ISR handlers ---- */
-void CAN1_RX0_IRQHandler(void);
+void USB_LP_CAN1_RX0_IRQHandler(void);  /* 注意: F103 md 启动文件向量名是 USB_LP_CAN1_RX0 */
 void CAN1_RX1_IRQHandler(void);
 void CAN1_SCE_IRQHandler(void);
 
